@@ -3,19 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, viewport-fit=cover, user-scalable=no" />
-  <meta name="theme-color" content="#0e0f13" />
   
-  <!-- PWA 核心 -->
-  <link rel="manifest" href="manifest.json">
+  <!-- PWA & iOS 支持 -->
+  <meta name="theme-color" content="#0e0f13" />
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="P1 互联">
-  <!-- iOS 图标 -->
-  <link rel="apple-touch-icon" href="https://cdn.jsdelivr.net/npm/ionicons@5.5.2/dist/svg/chatbubble-ellipses.svg">
-
-  <title>P1 即时通讯</title>
+  <meta name="apple-mobile-web-app-title" content="P1">
+  <link rel="apple-touch-icon" href="https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f4e1.png">
+  <link rel="manifest" href="manifest.json">
+  
+  <title>P1 隐秘网络</title>
   <style>
-    /* 全局变量与重置 */
     :root {
       --bg: #0e0f13; --panel: #13151b; --line: #232634;
       --text: #e6e6e6; --sub: #8ea0b8; --primary: #2a7cff;
@@ -25,17 +23,16 @@
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body { margin: 0; font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
     
-    /* 布局容器 */
     .app-shell { display: flex; width: 100%; height: 100%; max-width: 1200px; margin: 0 auto; background: var(--panel); position: relative; }
     
-    /* 侧边栏 (联系人) */
+    /* 侧边栏 */
     .sidebar { width: var(--sidebar-w); border-right: 1px solid var(--line); display: flex; flex-direction: column; background: #0b0d12; z-index: 2; }
     .my-card { padding: 16px; border-bottom: 1px solid var(--line); background: #0e1016; }
     .my-info { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
     .avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #2a7cff, #00c6ff); display: grid; place-items: center; font-weight: bold; color: #fff; font-size: 18px; flex-shrink: 0; }
     .my-name { font-weight: 600; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .status-row { display: flex; gap: 8px; font-size: 12px; color: var(--sub); align-items: center; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; transition: .3s; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
     .dot.online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
     
     .contact-list { flex: 1; overflow-y: auto; padding: 8px; }
@@ -45,19 +42,14 @@
     .c-top { display: flex; justify-content: space-between; margin-bottom: 4px; }
     .c-name { font-size: 14px; font-weight: 500; color: #fff; }
     .c-time { font-size: 11px; color: #555; }
-    .c-msg { font-size: 12px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     
-    /* 聊天主区域 */
+    /* 聊天区 */
     .chat-area { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); position: relative; }
-    
-    /* 聊天头部 */
     .chat-header { height: 56px; border-bottom: 1px solid var(--line); display: flex; align-items: center; padding: 0 16px; background: var(--panel); justify-content: space-between; }
     .ch-title { font-weight: 600; font-size: 16px; }
     .ch-status { font-size: 12px; color: var(--sub); margin-left: 8px; font-weight: normal; }
     .btn-icon { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; cursor: pointer; color: var(--sub); }
-    .btn-icon:hover { background: #1f232e; color: #fff; }
     
-    /* 消息列表 */
     .msg-list { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth; }
     .msg-row { display: flex; gap: 8px; max-width: 85%; }
     .msg-row.me { align-self: flex-end; flex-direction: row-reverse; }
@@ -67,15 +59,12 @@
     .msg-meta { font-size: 10px; opacity: 0.6; margin-top: 4px; text-align: right; }
     .sys-msg { align-self: center; background: rgba(255,255,255,0.05); padding: 4px 12px; border-radius: 99px; font-size: 12px; color: var(--sub); }
     
-    /* 发送区 */
     .send-box { min-height: 60px; border-top: 1px solid var(--line); background: var(--panel); padding: 10px; display: flex; align-items: flex-end; gap: 10px; }
     .input-wrap { flex: 1; background: #0a0c10; border: 1px solid #2b3040; border-radius: 20px; min-height: 40px; display: flex; align-items: center; padding: 4px 12px; }
     #editor { flex: 1; max-height: 100px; overflow-y: auto; outline: none; font-size: 15px; line-height: 1.4; }
     #editor:empty:before { content: '发送消息...'; color: #555; }
-    .send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--primary); color: #fff; border: none; display: grid; place-items: center; flex-shrink: 0; cursor: pointer; transition: .2s; }
-    .send-btn:disabled { background: #1f232e; color: #555; cursor: not-allowed; }
+    .send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--primary); color: #fff; border: none; display: grid; place-items: center; flex-shrink: 0; cursor: pointer; }
     
-    /* 移动端适配 */
     @media (max-width: 768px) {
       .sidebar { position: absolute; height: 100%; transform: translateX(0); transition: transform .3s; width: 100%; }
       .sidebar.hidden { transform: translateX(-100%); }
@@ -84,20 +73,13 @@
     }
     @media (min-width: 769px) {
       .mobile-back { display: none; }
-      .sidebar.hidden { display: flex; transform: none; }
+      .sidebar.hidden { display: flex; transform: none; } 
     }
 
-    /* 设置弹窗 */
     #settings-panel { position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 99; display: none; place-items: center; }
     .settings-box { width: 90%; max-width: 400px; background: #13151b; border-radius: 16px; padding: 20px; border: 1px solid var(--line); }
-    .st-row { margin-bottom: 16px; }
-    .st-row label { display: block; font-size: 12px; color: var(--sub); margin-bottom: 6px; }
-    .st-input { width: 100%; padding: 10px; background: #0a0c10; border: 1px solid #2b3040; border-radius: 8px; color: #fff; font-size: 16px; }
-    .st-btn { width: 100%; padding: 12px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; }
-    .btn-blue { background: var(--primary); color: #fff; }
-    
-    /* 安装提示横幅 */
-    #install-banner { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #2a7cff; color: white; padding: 10px 20px; border-radius: 30px; font-size: 14px; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.5); cursor: pointer; z-index: 100; }
+    .st-input { width: 100%; padding: 10px; background: #0a0c10; border: 1px solid #2b3040; border-radius: 8px; color: #fff; font-size: 16px; margin-bottom: 15px; }
+    .st-btn { width: 100%; padding: 12px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; background: #2a7cff; color: #fff; }
     
     .mini-log { position: absolute; top: 60px; right: 10px; width: 200px; height: 120px; background: rgba(0,0,0,0.8); color: #0f0; font-size: 10px; padding: 8px; border-radius: 8px; overflow: auto; pointer-events: none; opacity: 0.5; z-index: 10; display: none; }
   </style>
@@ -116,11 +98,11 @@
             <span id="statusText">离线</span>
           </div>
         </div>
-        <div class="btn-icon" id="btnSettings" onclick="ui.toggleSettings(true)">⚙️</div>
+        <div class="btn-icon" id="btnSettings">⚙️</div>
       </div>
       <div class="status-row" style="justify-content:space-between">
         <span>ID: <span id="myId">-</span></span>
-        <span id="onlineCount">0 在线</span>
+        <span id="onlineCount">0</span>
       </div>
     </div>
     <div class="contact-list" id="contactList"></div>
@@ -135,69 +117,37 @@
           <span class="ch-status" id="chatStatus"></span>
         </div>
       </div>
-      <div class="btn-icon" id="btnToggleLog" title="显示日志">📟</div>
+      <div class="btn-icon" id="btnToggleLog">📟</div>
     </header>
 
-    <div class="msg-list" id="msgList">
-      <div class="sys-msg">欢迎回来，系统已准备就绪</div>
-    </div>
+    <div class="msg-list" id="msgList"></div>
 
     <section class="send-box">
-      <div class="btn-icon" id="btnFile" onclick="ui.triggerFile()">📎</div>
+      <div class="btn-icon" id="btnFile">📎</div>
       <div class="input-wrap">
         <div id="editor" contenteditable="true"></div>
       </div>
       <button class="send-btn" id="btnSend">➤</button>
-      <input type="file" id="fileInput" style="display:none" multiple>
+      <input type="file" id="fileInput" style="display:none">
     </section>
-    
     <div class="mini-log" id="miniLog"></div>
   </main>
 </div>
 
 <div id="settings-panel">
   <div class="settings-box">
-    <h3 style="margin-top:0">连接设置</h3>
-    <div class="st-row">
-      <label>我的昵称</label>
-      <input class="st-input" id="iptNick" placeholder="输入昵称">
-    </div>
-    <div class="st-row">
-      <label>手动添加节点 ID</label>
-      <input class="st-input" id="iptPeer" placeholder="对方 ID">
-    </div>
-    <button class="st-btn btn-blue" id="btnSave">保存并重连</button>
-    <button class="st-btn" id="btnCloseSettings" onclick="ui.toggleSettings(false)" style="margin-top:10px;background:transparent;color:#666">关闭</button>
+    <h3 style="margin-top:0">设置</h3>
+    <input class="st-input" id="iptNick" placeholder="我的昵称">
+    <input class="st-input" id="iptPeer" placeholder="添加节点 ID (可选)">
+    <button class="st-btn" id="btnSave">保存</button>
+    <button class="st-btn" id="btnCloseSettings" style="margin-top:10px;background:transparent;color:#666">关闭</button>
   </div>
 </div>
-
-<!-- 安装提示 -->
-<div id="install-banner" onclick="installPWA()">📲 添加到桌面 / 安装应用</div>
 
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.0/dist/peerjs.min.js"></script>
 <script src="easytier.js"></script>
 <script>
-  // PWA 安装逻辑
-  let deferredPrompt;
   if('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js');
-
-  window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredPrompt = e;
-    const banner = document.getElementById('install-banner');
-    banner.style.display = 'block';
-  });
-
-  function installPWA() {
-    const banner = document.getElementById('install-banner');
-    banner.style.display = 'none';
-    if(deferredPrompt) {
-      deferredPrompt.prompt();
-      deferredPrompt.userChoice.then((choiceResult) => {
-        deferredPrompt = null;
-      });
-    }
-  }
 </script>
 </body>
 </html>
