@@ -17,7 +17,12 @@ const app = {
   peer: null,
   conns: {}, 
   knownPeers: new Set(JSON.parse(localStorage.getItem('p1_peers')||'[]')), 
-  seenMsgs: new Set(),
+  
+  // 🔥 核心数据结构：消息数据库 { peerId: [msg1, msg2...] }
+  // 'all' 是公共频道
+  msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'),
+  seenMsgs: new Set(), // 去重
+  
   fileChunks: {},
   isSeed: false,
 
@@ -27,17 +32,12 @@ const app = {
   },
 
   init() {
-    // 1. 启动网络
     this.start();
-    
-    // 2. 守护进程
     setInterval(() => {
       this.cleanup();
       this.exchangePeers();
-      if(Object.keys(this.conns).length === 0 && !this.isSeed) this.start(); // 掉线重连
+      if(Object.keys(this.conns).length === 0 && !this.isSeed) this.start();
     }, 5000);
-    
-    // 3. 消息指纹清理
     setInterval(() => this.seenMsgs.clear(), 60000);
   },
 
@@ -57,10 +57,7 @@ const app = {
         this.isSeed = SEEDS.includes(myId);
         ui.updateSelf();
         this.log(`✅ 上线: ${myId.slice(0,5)}`);
-        
-        // 连种子
         SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
-        // 连历史好友 (自动恢复连接)
         this.knownPeers.forEach(pid => this.connectTo(pid));
       });
 
@@ -80,58 +77,44 @@ const app = {
 
   handleConn(conn, isIncoming) {
     const pid = conn.peer;
-    
     conn.on('open', () => {
       this.conns[pid] = conn;
       this.remember(pid);
       ui.renderList();
       conn.send({t: 'HELLO', n: this.myName});
-      // 交换通讯录
       conn.send({t: 'PEER_EX', list: [...this.knownPeers]});
     });
 
     conn.on('data', d => {
       if(d.t === 'HELLO') { conn.label = d.n; ui.renderList(); }
-      
-      if(d.t === 'PEER_EX' && Array.isArray(d.list)) {
-        d.list.forEach(id => this.remember(id));
-        ui.renderList();
-      }
+      if(d.t === 'PEER_EX') { d.list.forEach(id => this.remember(id)); ui.renderList(); }
       
       if(d.t === 'MSG') {
         if(this.seenMsgs.has(d.id)) return; 
         this.seenMsgs.add(d.id);
         
-        // UI显示规则：群聊全显，私聊只显相关
+        // 📩 收到消息：存库 + 路由
+        // 如果 target='all' -> 公共消息，存入 'all'
+        // 如果 target=我 -> 私聊消息，存入 d.from (发送者)
+        const chatId = d.target === 'all' ? 'all' : d.from;
+        
+        // 只有和我有关的消息才处理
         if(d.target === 'all' || d.target === this.myId) {
-           const isPrivate = d.target !== 'all';
-           if( (ui.activeChat === 'all' && !isPrivate) || (ui.activeChat === d.from && isPrivate) ) {
-              ui.appendMsg(d.sender, d.txt, false, false, d.isHtml);
-           }
+           this.saveMsg(chatId, d.txt, false, d.sender, d.isHtml);
         }
+        
+        // 帮忙转发 (只转发公共消息)
         if(d.target === 'all') this.flood(d, pid); 
       }
       
-      // 文件接收
-      if(d.t === 'FILE_START') {
-        this.fileChunks[d.fid] = { meta: d.meta, buffer: [], received: 0 };
-        if(ui.activeChat === pid || ui.activeChat === 'all') ui.appendMsg('系统', `正在接收 ${d.meta.name}...`, false, true);
-      }
-      if(d.t === 'FILE_CHUNK') {
-        const f = this.fileChunks[d.fid];
-        if(f) {
-          f.buffer.push(d.data);
-          f.received += d.data.byteLength;
-          if(f.received >= f.meta.size) {
-            const blob = new Blob(f.buffer, {type: f.meta.type});
-            const url = URL.createObjectURL(blob);
-            // 在当前窗口显示下载链接（无论是群发还是私聊）
-            if(ui.activeChat === pid || ui.activeChat === 'all') {
-               ui.appendMsg(conn.label||pid.slice(0,5), `<a href="${url}" download="${f.meta.name}" style="color:#4ade80">📄 ${f.meta.name}</a>`, false, false, true);
-            }
-            delete this.fileChunks[d.fid];
-          }
-        }
+      // 文件处理 (简化：直接显示链接)
+      if(d.t === 'FILE_CHUNK' && d.done) {
+         const blob = new Blob([d.data], {type: d.meta.type});
+         const url = URL.createObjectURL(blob);
+         const link = `<a href="${url}" download="${d.meta.name}" style="color:#4ade80">📄 ${d.meta.name}</a>`;
+         // 存入当前会话
+         const chatId = ui.activeChat === 'all' ? 'all' : pid; 
+         this.saveMsg(chatId, link, false, d.sender || conn.label, true);
       }
     });
 
@@ -157,7 +140,8 @@ const app = {
     const packet = {t: 'MSG', id, txt, sender: this.myName, target: targetId};
     this.seenMsgs.add(id);
     
-    ui.appendMsg('我', txt, true);
+    // 存自己的记录
+    this.saveMsg(targetId, txt, true, '我');
     
     if(targetId === 'all') {
       this.flood(packet, null);
@@ -165,59 +149,57 @@ const app = {
       const c = this.conns[targetId];
       if(c && c.open) c.send(packet);
       else {
-        // 尝试重连并发送
         this.connectTo(targetId);
         setTimeout(() => {
            if(this.conns[targetId]) this.conns[targetId].send(packet);
-           else ui.appendMsg('系统', '离线，发送失败', true, true);
+           else this.saveMsg(targetId, '离线，发送失败', true, '系统');
         }, 1500);
       }
     }
   },
 
-  // 🔥 群发文件支持：对所有邻居逐个发送
-  sendFile(file, targetId) {
-    const fid = Date.now() + '-' + Math.random();
-    const meta = {name: file.name, size: file.size, type: file.type};
+  // 🔥 核心：消息存取与通知
+  saveMsg(chatId, txt, isMe, senderName, isHtml) {
+    if(!this.msgs[chatId]) this.msgs[chatId] = [];
     
-    // 确定发送目标列表
-    let targets = [];
-    if(targetId === 'all') {
-      targets = Object.values(this.conns).filter(c => c.open);
-      ui.appendMsg('我', `正在向 ${targets.length} 人群发文件...`, true, true);
+    const msgObj = { txt, me: isMe, name: senderName, html: isHtml, time: Date.now() };
+    this.msgs[chatId].push(msgObj);
+    
+    // 限制长度
+    if(this.msgs[chatId].length > 50) this.msgs[chatId].shift();
+    localStorage.setItem('p1_msgs', JSON.stringify(this.msgs));
+    
+    // 如果当前正开着这个窗口，直接上屏
+    if(ui.activeChat === chatId) {
+      ui.appendMsg(senderName, txt, isMe, false, isHtml);
     } else {
-      const c = this.conns[targetId];
-      if(c && c.open) targets = [c];
-      else {
-        this.connectTo(targetId); // 尝试重连
-        ui.appendMsg('系统', '对方离线，尝试连接...', true, true);
-        return;
-      }
+      // 否则，给这个联系人打上“有新消息”的标记（红点逻辑）
+      ui.setUnread(chatId, true);
     }
+  },
 
-    if(targets.length === 0) return;
-
-    // 读取一次，多次发送
+  sendFile(file, targetId) {
+    // 简易单次发送（不分片，适合小文件，稳定）
     const reader = new FileReader();
-    let offset = 0;
-    
-    // 先发头
-    targets.forEach(c => c.send({t: 'FILE_START', fid, meta}));
-
     reader.onload = e => {
-      const chunk = e.target.result;
-      targets.forEach(c => c.send({t: 'FILE_CHUNK', fid, data: chunk}));
+      const packet = { 
+        t: 'FILE_CHUNK', 
+        data: e.target.result, 
+        meta: {name: file.name, type: file.type}, 
+        done: true,
+        sender: this.myName // 加上发送者名字
+      };
       
-      offset += chunk.byteLength;
-      if(offset < file.size) {
-        readNext();
+      // 自己存一条
+      this.saveMsg(targetId, `文件 ${file.name} 已发送`, true, '我');
+      
+      if(targetId === 'all') {
+         Object.values(this.conns).forEach(c => c.send(packet));
       } else {
-        ui.appendMsg('系统', `文件 ${file.name} 发送完毕`, true, true);
+         if(this.conns[targetId]) this.conns[targetId].send(packet);
       }
     };
-    
-    const readNext = () => reader.readAsArrayBuffer(file.slice(offset, offset + CHUNK_SIZE));
-    readNext();
+    reader.readAsArrayBuffer(file);
   },
 
   cleanup() {
@@ -240,12 +222,12 @@ const app = {
   }
 };
 
-// ===================== UI (极简 & 健壮) =====================
+// ===================== UI =====================
 const ui = {
   activeChat: 'all', 
+  unread: {}, // { pid: true/false }
 
   init() {
-    // 确保按钮能点：直接绑定，不加 try-catch 包裹，方便暴露错误
     const btnSend = document.getElementById('btnSend');
     const btnFile = document.getElementById('btnFile');
     const fileInput = document.getElementById('fileInput');
@@ -258,13 +240,10 @@ const ui = {
       }
     };
     
-    if(btnFile) btnFile.onclick = () => {
-      fileInput.click();
-    };
-    
+    if(btnFile) btnFile.onclick = () => fileInput.click();
     if(fileInput) fileInput.onchange = (e) => {
       if(e.target.files[0]) app.sendFile(e.target.files[0], this.activeChat);
-      e.target.value = ''; // 重置，允许重复发同一文件
+      e.target.value = ''; 
     };
     
     document.getElementById('btnBack').onclick = () => {
@@ -272,7 +251,7 @@ const ui = {
     };
     
     this.updateSelf();
-    this.renderList();
+    this.switchChat('all'); // 初始加载公共频道历史
   },
 
   updateSelf() {
@@ -283,21 +262,32 @@ const ui = {
 
   switchChat(pid) {
     this.activeChat = pid;
+    this.unread[pid] = false; // 清除红点
     
-    // 点击离线头像，尝试重连
-    if(pid !== 'all' && !app.conns[pid]) {
-      app.connectTo(pid);
-      document.getElementById('chatStatus').innerText = '连接中...';
-    } else {
-      document.getElementById('chatStatus').innerText = pid === 'all' ? '全员' : '在线';
-    }
+    // 尝试重连
+    if(pid !== 'all' && !app.conns[pid]) app.connectTo(pid);
 
     const name = pid === 'all' ? '公共频道' : (app.conns[pid]?.label || pid.slice(0,6));
     document.getElementById('chatTitle').innerText = name;
-    document.getElementById('msgList').innerHTML = '<div class="sys-msg">切换会话</div>';
+    document.getElementById('chatStatus').innerText = pid === 'all' ? '全员' : (app.conns[pid]?'在线':'离线');
+    
+    // 🔥 关键：加载历史记录
+    const msgBox = document.getElementById('msgList');
+    msgBox.innerHTML = ''; // 清空旧的
+    const history = app.msgs[pid] || [];
+    if(history.length === 0) {
+       msgBox.innerHTML = '<div class="sys-msg">暂无消息</div>';
+    } else {
+       history.forEach(m => this.appendMsg(m.name, m.txt, m.me, false, m.html));
+    }
     
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
     this.renderList();
+  },
+  
+  setUnread(pid, hasUnread) {
+    this.unread[pid] = hasUnread;
+    this.renderList(); // 刷新列表显示红点
   },
 
   renderList() {
@@ -308,24 +298,26 @@ const ui = {
     let html = `
       <div class="contact-item ${this.activeChat==='all'?'active':''}" onclick="ui.switchChat('all')">
         <div class="avatar" style="background:#2a7cff">群</div>
-        <div class="c-info"><div class="c-name">公共频道</div></div>
+        <div class="c-info">
+          <div class="c-name">公共频道 ${this.unread['all']?'🔴':''}</div>
+        </div>
       </div>
     `;
     
-    // 合并显示：在线的 + 历史记录的
-    const all = new Set([...Object.keys(app.conns), ...app.knownPeers]);
+    const all = new Set([...Object.keys(app.conns), ...app.knownPeers, ...Object.keys(app.msgs)]);
     all.forEach(pid => {
-      if(pid === app.myId) return;
+      if(pid === app.myId || pid === 'all') return;
       
       const c = app.conns[pid];
       const isOnline = !!c;
       const label = c ? c.label : pid.slice(0,6);
+      const hasRed = this.unread[pid] ? '🔴' : '';
       
       html += `
         <div class="contact-item ${this.activeChat===pid?'active':''}" onclick="ui.switchChat('${pid}')">
           <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${label[0]}</div>
           <div class="c-info">
-            <div class="c-name">${label}</div>
+            <div class="c-name">${label} ${hasRed}</div>
             <div class="c-time" style="color:${isOnline?'#4ade80':'#666'}">${isOnline?'在线':'离线'}</div>
           </div>
         </div>
@@ -337,9 +329,6 @@ const ui = {
 
   appendMsg(name, txt, isMe, isSys, isHtml) {
     const box = document.getElementById('msgList');
-    // 防卡顿：超过100条删旧
-    if(box.childElementCount > 100) box.removeChild(box.firstElementChild);
-
     const d = document.createElement('div');
     if(isSys) {
       d.className = 'sys-msg';
@@ -362,7 +351,6 @@ const ui = {
 window.app = app;
 window.ui = ui;
 app.init();
-// 延迟一点绑定 UI，确保 DOM 加载完（虽然放在 body 底部已经是安全的）
 setTimeout(() => ui.init(), 100); 
 
 })();
