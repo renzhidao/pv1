@@ -7,6 +7,7 @@ const CONFIG = {
   debug: 0
 };
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3'];
+const CHUNK_SIZE = 64 * 1024;
 
 // === 核心逻辑 ===
 const app = {
@@ -32,10 +33,9 @@ const app = {
     
     this.start();
     
-    // 强力守护：每3秒检查一次所有朋友
+    // 强力守护
     setInterval(() => this.heal(), 3000);
     
-    // 唤醒重连
     document.addEventListener('visibilitychange', () => {
       if(document.visibilityState==='visible') { this.start(); this.heal(); }
     });
@@ -93,7 +93,6 @@ const app = {
       conn.send({t: 'HELLO', n: this.myName});
       conn.send({t: 'PEER_EX', list: Object.keys(this.friends)});
       
-      // 记录新朋友
       if(!this.friends[pid]) {
         this.friends[pid] = {name: pid.slice(0,6), lastSeen: Date.now(), unread: 0};
         this.saveFriends();
@@ -106,7 +105,6 @@ const app = {
         this.friends[pid].name = d.n;
         this.saveFriends();
         ui.renderList();
-        // 正在聊天？更新标题
         if(ui.active === pid) document.getElementById('chatTitle').innerText = d.n;
       }
       
@@ -154,10 +152,7 @@ const app = {
     } else {
       const c = this.conns[targetId];
       if(c && c.open) c.send(pkt);
-      else {
-        // 离线暂存逻辑略，直接尝试连接
-        this.connect(targetId);
-      }
+      else this.connect(targetId);
     }
   },
 
@@ -198,36 +193,36 @@ const ui = {
   active: 'all',
 
   init() {
-    // 绑定必须确保 DOM 存在
-    const btnSend = document.getElementById('btnSend');
-    if(btnSend) btnSend.onclick = () => {
+    const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
+    
+    bind('btnSend', () => {
       const el = document.getElementById('editor');
       if(el.innerText) { app.send(el.innerText, this.active); el.innerText = ''; }
+    });
+    
+    bind('btnFile', () => document.getElementById('fileInput').click());
+    document.getElementById('fileInput').onchange = (e) => {
+      if(e.target.files[0]) app.sendFile(e.target.files[0], this.active);
     };
     
-    const btnFile = document.getElementById('btnFile');
-    if(btnFile) {
-      btnFile.onclick = () => document.getElementById('fileInput').click();
-      document.getElementById('fileInput').onchange = (e) => {
-        if(e.target.files[0]) app.sendFile(e.target.files[0], this.active);
-      };
-    }
-    
-    // 设置逻辑
-    document.getElementById('btnSettings').onclick = () => {
+    bind('btnSettings', () => {
         document.getElementById('settings-panel').style.display = 'grid';
         document.getElementById('iptNick').value = app.myName;
-    };
-    document.getElementById('btnCloseSettings').onclick = () => document.getElementById('settings-panel').style.display = 'none';
-    document.getElementById('btnSave').onclick = () => {
+    });
+    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
+    bind('btnSave', () => {
         const n = document.getElementById('iptNick').value;
-        if(n) { app.myName = n; localStorage.setItem('nickname', n); app.start(); } // 重启以更新名字
+        if(n) { app.myName = n; localStorage.setItem('nickname', n); app.start(); }
         const p = document.getElementById('iptPeer').value;
         if(p) app.connect(p);
         document.getElementById('settings-panel').style.display = 'none';
-    };
+    });
+    bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
+    bind('btnToggleLog', () => {
+       const el = document.getElementById('miniLog');
+       el.style.display = el.style.display==='block'?'none':'block';
+    });
     
-    // 安装按钮
     window.addEventListener('beforeinstallprompt', e => {
       e.preventDefault();
       window.deferredPrompt = e;
@@ -239,7 +234,8 @@ const ui = {
     });
 
     this.updateSelf();
-    this.switch('all');
+    this.renderList();
+    this.renderMsgs();
   },
 
   updateSelf() {
@@ -280,7 +276,6 @@ const ui = {
     
     const name = pid === 'all' ? '公共频道' : app.friends[pid].name;
     document.getElementById('chatTitle').innerText = name;
-    document.getElementById('chatStatus').innerText = pid === 'all' ? '全员' : (app.conns[pid]?'在线':'离线');
     
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
     this.renderList();
