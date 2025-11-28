@@ -7,6 +7,7 @@ const CONFIG = {
   debug: 0
 };
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3'];
+const CHUNK = 64 * 1024;
 
 // === 核心逻辑 ===
 const app = {
@@ -17,7 +18,8 @@ const app = {
   friends: JSON.parse(localStorage.getItem('p1_friends') || '{}'),
   msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'),
   seen: new Set(),
-  
+  isSeed: false,
+
   log(s) {
     const el = document.getElementById('miniLog');
     if(el) el.innerText = s + '\n' + el.innerText.slice(0, 200);
@@ -41,15 +43,15 @@ const app = {
 
   start() {
     if(this.peer && !this.peer.destroyed) return;
-    
     try {
       const p = new Peer(this.myId, CONFIG);
       
       p.on('open', id => {
         this.myId = id;
         this.peer = p;
+        this.isSeed = SEEDS.includes(id);
+        this.log('✅ 上线: ' + id);
         ui.updateSelf();
-        this.log('✅ 上线');
         this.heal();
       });
 
@@ -93,7 +95,7 @@ const app = {
       
       if(!this.friends[pid]) {
         this.friends[pid] = {name: pid.slice(0,5), unread: 0};
-        this.saveFriends();
+        this.save();
       }
       ui.renderList();
     });
@@ -101,27 +103,23 @@ const app = {
     conn.on('data', d => {
       if(d.t === 'HELLO') {
         this.friends[pid].name = d.n;
-        this.saveFriends();
+        this.save();
         ui.renderList();
-        if(ui.active === pid) document.getElementById('chatTitle').innerText = d.n;
+        if(ui.active === pid) document.querySelector('.ch-title').innerText = d.n;
       }
-      
       if(d.t === 'PEER_EX') {
-        d.list.forEach(id => {
-          if(id !== this.myId && !this.friends[id]) {
-            this.friends[id] = {name: id.slice(0,5), unread: 0};
-          }
+        d.l.forEach(id => {
+          if(id !== this.myId && !this.friends[id]) this.friends[id] = {name: id.slice(0,5), unread:0};
         });
-        this.saveFriends();
+        this.save();
       }
-      
       if(d.t === 'MSG') {
         if(this.seen.has(d.id)) return;
         this.seen.add(d.id);
         
         const key = d.target === 'all' ? 'all' : d.sender;
         if(d.target === 'all' || d.target === this.myId) {
-           this.saveMsg(key, d.txt, false, d.name, d.html);
+          this.saveMsg(key, d.txt, false, d.name, d.html);
         }
         if(d.target === 'all') this.flood(d, pid);
       }
@@ -164,7 +162,7 @@ const app = {
     else {
       if(this.friends[key]) this.friends[key].unread = (this.friends[key].unread||0) + 1;
       if(key === 'all') this.friends['all'] = {unread: (this.friends['all']?.unread||0)+1};
-      this.saveFriends();
+      this.save();
       ui.renderList();
     }
   },
@@ -172,7 +170,7 @@ const app = {
   sendFile(file, targetId) {
     const reader = new FileReader();
     reader.onload = e => {
-      const url = e.target.result; // Base64
+      const url = e.target.result;
       const html = `<div style="background:#333;padding:10px;border-radius:5px">
         <div>📄 ${file.name}</div>
         <a href="${url}" download="${file.name}" style="color:#4ade80;display:block;margin-top:5px">点击下载 (${(file.size/1024).toFixed(1)}KB)</a>
@@ -182,15 +180,14 @@ const app = {
     reader.readAsDataURL(file);
   },
   
-  saveFriends() { localStorage.setItem('p1_friends', JSON.stringify(this.friends)); }
+  save() { localStorage.setItem('p1_friends', JSON.stringify(this.friends)); }
 };
 
-// ===================== UI =====================
+// === UI ===
 const ui = {
   active: 'all',
 
   init() {
-    // DOM 元素绑定 (确保元素存在再绑)
     const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; }
     
     bind('btnSend', () => {
@@ -204,7 +201,7 @@ const ui = {
       if(f) app.sendFile(f, this.active);
     };
     
-    bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
+    bind('btnBack', () => document.querySelector('.sidebar').classList.remove('hidden'));
     bind('btnSettings', () => {
         document.getElementById('settings-panel').style.display = 'grid';
         document.getElementById('iptNick').value = app.myName;
@@ -275,13 +272,13 @@ const ui = {
     this.active = pid;
     if(app.friends[pid]) app.friends[pid].unread = 0; 
     if(pid === 'all' && app.friends['all']) app.friends['all'].unread = 0;
-    app.saveFriends();
+    app.save();
     
     const name = pid === 'all' ? '公共频道' : app.friends[pid].name;
     document.querySelector('.ch-title').innerText = name;
     document.querySelector('.ch-status').innerText = pid === 'all' ? 'Mesh 广播' : (app.conns[pid]?'在线':'离线');
     
-    if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
+    if(window.innerWidth < 768) document.querySelector('.sidebar').classList.add('hidden');
     this.renderList();
     this.renderMsgs();
   },
@@ -307,7 +304,6 @@ const ui = {
 // 启动
 window.app = app;
 window.ui = ui;
-// 确保 DOM 加载
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ()=>app.init());
 else { app.init(); setTimeout(()=>ui.init(), 100); }
 
