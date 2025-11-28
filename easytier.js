@@ -8,17 +8,17 @@ const CONFIG = {
 };
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3'];
 
+// === 核心逻辑 ===
 const app = {
   myId: localStorage.getItem('p1_fixed_id'),
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
   
   peer: null,
-  conns: {}, 
-  friends: JSON.parse(localStorage.getItem('p1_friends') || '{}'),
-  msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'),
+  conns: {}, // 活跃连接
+  friends: JSON.parse(localStorage.getItem('p1_friends') || '{}'), // 通讯录
+  msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'), // 消息
   seen: new Set(),
-  pending: [], 
-
+  
   log(s) {
     const el = document.getElementById('miniLog');
     if(el) el.innerText = s + '\n' + el.innerText.slice(0, 200);
@@ -29,19 +29,15 @@ const app = {
       this.myId = 'u-' + Math.random().toString(36).substr(2, 9);
       localStorage.setItem('p1_fixed_id', this.myId);
     }
-
-    this.start();
-
-    // 极速自愈模式：前30秒高频重连，之后转为低频
-    let interval = 1000;
-    let timer = setInterval(() => this.heal(), interval);
-    setTimeout(() => { clearInterval(timer); setInterval(() => this.heal(), 3000); }, 30000);
     
+    this.start();
+    
+    // 强力守护：每3秒检查一次所有朋友
+    setInterval(() => this.heal(), 3000);
+    
+    // 唤醒重连
     document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState==='visible') {
-        this.start();
-        this.heal();
-      }
+      if(document.visibilityState==='visible') { this.start(); this.heal(); }
     });
   },
 
@@ -60,11 +56,9 @@ const app = {
       });
 
       p.on('connection', conn => this.setup(conn));
-      
       p.on('error', err => {
         if(err.type === 'unavailable-id') setTimeout(() => this.start(), 2000);
       });
-      
       this.peer = p;
     } catch(e) { this.log(e); }
   },
@@ -74,28 +68,18 @@ const app = {
       if(this.peer) this.peer.reconnect();
       return;
     }
-    
+    // 遍历所有朋友，断了就连
     Object.keys(this.friends).forEach(pid => {
       if (!this.conns[pid] || !this.conns[pid].open) this.connect(pid);
     });
-    
+    // 连种子
     SEEDS.forEach(s => {
       if(s !== this.myId && (!this.conns[s] || !this.conns[s].open)) this.connect(s);
     });
-    
-    // 处理离线队列
-    if(this.pending.length > 0) {
-      const now = Date.now();
-      this.pending = this.pending.filter(msg => {
-        if(now - msg.t > 60000) return false; 
-        this.flood(msg);
-        return true;
-      });
-    }
   },
 
   connect(id) {
-    if(id === this.myId || (this.conns[id] && this.conns[id].open)) return;
+    if(id === this.myId) return;
     if(this.peer) {
         const conn = this.peer.connect(id, {reliable: true});
         this.setup(conn);
@@ -104,12 +88,12 @@ const app = {
 
   setup(conn) {
     const pid = conn.peer;
-    
     conn.on('open', () => {
       this.conns[pid] = conn;
       conn.send({t: 'HELLO', n: this.myName});
       conn.send({t: 'PEER_EX', list: Object.keys(this.friends)});
       
+      // 记录新朋友
       if(!this.friends[pid]) {
         this.friends[pid] = {name: pid.slice(0,6), lastSeen: Date.now(), unread: 0};
         this.saveFriends();
@@ -120,9 +104,10 @@ const app = {
     conn.on('data', d => {
       if(d.t === 'HELLO') {
         this.friends[pid].name = d.n;
-        this.friends[pid].lastSeen = Date.now();
         this.saveFriends();
         ui.renderList();
+        // 正在聊天？更新标题
+        if(ui.active === pid) document.getElementById('chatTitle').innerText = d.n;
       }
       
       if(d.t === 'PEER_EX') {
@@ -140,9 +125,8 @@ const app = {
         
         const key = d.target === 'all' ? 'all' : d.sender;
         if(d.target === 'all' || d.target === this.myId) {
-           this.saveMsg(key, d.txt, false, d.name);
+           this.saveMsg(key, d.txt, false, d.name, d.html);
         }
-        
         if(d.target === 'all') this.flood(d, pid);
       }
     });
@@ -153,39 +137,33 @@ const app = {
 
   flood(pkt, exclude) {
     Object.keys(this.conns).forEach(pid => {
-      if(pid !== exclude) {
-        try { this.conns[pid].send(pkt); } catch(e){}
-      }
+      if(pid !== exclude) { try { this.conns[pid].send(pkt); } catch(e){} }
     });
   },
 
-  send(txt, targetId) {
+  send(txt, targetId, isHtml) {
     const id = Date.now() + Math.random().toString();
-    const pkt = {t: 'MSG', id, txt, name: this.myName, sender: this.myId, target: targetId};
+    const pkt = {t: 'MSG', id, txt, name: this.myName, sender: this.myId, target: targetId, html: isHtml};
     this.seen.add(id);
     
     const key = targetId === 'all' ? 'all' : targetId;
-    this.saveMsg(key, txt, true, '我');
+    this.saveMsg(key, txt, true, '我', isHtml);
     
-    let sent = false;
     if(targetId === 'all') {
       this.flood(pkt, null);
-      sent = true;
     } else {
       const c = this.conns[targetId];
-      if(c && c.open) { c.send(pkt); sent = true; }
-    }
-    
-    if(!sent) {
-      this.pending.push({...pkt, t: Date.now()});
-      this.log('离线暂存...');
-      this.connect(targetId);
+      if(c && c.open) c.send(pkt);
+      else {
+        // 离线暂存逻辑略，直接尝试连接
+        this.connect(targetId);
+      }
     }
   },
 
-  saveMsg(key, txt, me, name) {
+  saveMsg(key, txt, me, name, html) {
     if(!this.msgs[key]) this.msgs[key] = [];
-    this.msgs[key].push({txt, me, name});
+    this.msgs[key].push({txt, me, name, html});
     if(this.msgs[key].length > 50) this.msgs[key].shift();
     localStorage.setItem('p1_msgs', JSON.stringify(this.msgs));
     
@@ -199,9 +177,20 @@ const app = {
     }
   },
   
-  saveFriends() {
-    localStorage.setItem('p1_friends', JSON.stringify(this.friends));
-  }
+  sendFile(file, targetId) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const url = e.target.result; // Base64
+      const html = `<div style="background:#333;padding:10px;border-radius:5px">
+        <div>📄 ${file.name}</div>
+        <a href="${url}" download="${file.name}" style="color:#4ade80;display:block;margin-top:5px">点击下载 (${(file.size/1024).toFixed(1)}KB)</a>
+      </div>`;
+      this.send(html, targetId, true);
+    };
+    reader.readAsDataURL(file);
+  },
+  
+  saveFriends() { localStorage.setItem('p1_friends', JSON.stringify(this.friends)); }
 };
 
 // ===================== UI =====================
@@ -209,11 +198,36 @@ const ui = {
   active: 'all',
 
   init() {
-    document.getElementById('btnSend').onclick = () => {
+    // 绑定必须确保 DOM 存在
+    const btnSend = document.getElementById('btnSend');
+    if(btnSend) btnSend.onclick = () => {
       const el = document.getElementById('editor');
       if(el.innerText) { app.send(el.innerText, this.active); el.innerText = ''; }
     };
     
+    const btnFile = document.getElementById('btnFile');
+    if(btnFile) {
+      btnFile.onclick = () => document.getElementById('fileInput').click();
+      document.getElementById('fileInput').onchange = (e) => {
+        if(e.target.files[0]) app.sendFile(e.target.files[0], this.active);
+      };
+    }
+    
+    // 设置逻辑
+    document.getElementById('btnSettings').onclick = () => {
+        document.getElementById('settings-panel').style.display = 'grid';
+        document.getElementById('iptNick').value = app.myName;
+    };
+    document.getElementById('btnCloseSettings').onclick = () => document.getElementById('settings-panel').style.display = 'none';
+    document.getElementById('btnSave').onclick = () => {
+        const n = document.getElementById('iptNick').value;
+        if(n) { app.myName = n; localStorage.setItem('nickname', n); app.start(); } // 重启以更新名字
+        const p = document.getElementById('iptPeer').value;
+        if(p) app.connect(p);
+        document.getElementById('settings-panel').style.display = 'none';
+    };
+    
+    // 安装按钮
     window.addEventListener('beforeinstallprompt', e => {
       e.preventDefault();
       window.deferredPrompt = e;
@@ -221,16 +235,16 @@ const ui = {
       btn.className = 'btn-icon';
       btn.innerText = '📲';
       btn.onclick = () => window.deferredPrompt.prompt();
-      document.querySelector('.header').appendChild(btn);
+      document.querySelector('.chat-header').appendChild(btn);
     });
 
     this.updateSelf();
-    this.renderList();
-    this.renderMsgs();
+    this.switch('all');
   },
 
   updateSelf() {
     document.getElementById('myId').innerText = app.myId.slice(0,6);
+    document.getElementById('myNick').innerText = app.myName;
   },
 
   renderList() {
@@ -264,6 +278,11 @@ const ui = {
     if(pid === 'all' && app.friends['all']) app.friends['all'].unread = 0;
     app.saveFriends();
     
+    const name = pid === 'all' ? '公共频道' : app.friends[pid].name;
+    document.getElementById('chatTitle').innerText = name;
+    document.getElementById('chatStatus').innerText = pid === 'all' ? '全员' : (app.conns[pid]?'在线':'离线');
+    
+    if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
     this.renderList();
     this.renderMsgs();
   },
@@ -273,10 +292,13 @@ const ui = {
     box.innerHTML = '';
     const msgs = app.msgs[this.active] || [];
     msgs.forEach(m => {
+      const content = m.html ? m.txt : m.txt.replace(/</g,'<');
       box.innerHTML += `
         <div class="msg-row ${m.me?'me':'other'}">
-          <div class="msg-bubble">${m.txt}</div>
-          ${!m.me?`<div class="msg-meta">${m.name}</div>`:''}
+          <div class="msg-bubble">
+            ${content}
+            ${!m.me?`<div class="msg-meta">${m.name}</div>`:''}
+          </div>
         </div>`;
     });
     box.scrollTop = box.scrollHeight;
