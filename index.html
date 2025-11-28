@@ -9,6 +9,7 @@
   <link rel="manifest" href="manifest.json">
   <title>P1 隐秘网络</title>
   <style>
+    /* 恢复之前的精致暗色主题 */
     :root {
       --bg: #0e0f13; --panel: #13151b; --line: #232634;
       --text: #e6e6e6; --sub: #8ea0b8; --primary: #2a7cff;
@@ -18,7 +19,6 @@
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body { margin: 0; font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
     
-    /* 布局 */
     .app-shell { display: flex; width: 100%; height: 100%; max-width: 1200px; margin: 0 auto; background: var(--panel); position: relative; }
     
     /* 侧边栏 */
@@ -33,37 +33,38 @@
     
     .contact-list { flex: 1; overflow-y: auto; padding: 8px; }
     .contact-item { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; transition: .2s; margin-bottom: 4px; }
-    .contact-item.active { background: #1f232e; }
+    .contact-item:active, .contact-item.active { background: #1f232e; }
     .c-info { flex: 1; min-width: 0; }
+    .c-top { display: flex; justify-content: space-between; margin-bottom: 4px; }
     .c-name { font-size: 14px; font-weight: 500; color: #fff; }
-    .c-msg { font-size: 12px; color: var(--sub); }
+    .c-time { font-size: 11px; color: #555; }
+    .c-msg { font-size: 12px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     
     /* 聊天区 */
     .chat-area { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); position: relative; }
     .chat-header { height: 56px; border-bottom: 1px solid var(--line); display: flex; align-items: center; padding: 0 16px; background: var(--panel); justify-content: space-between; }
     .ch-title { font-weight: 600; font-size: 16px; }
-    .ch-status { font-size: 12px; color: var(--sub); margin-left: 8px; }
-    .btn-icon { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; cursor: pointer; color: var(--sub); font-size: 18px; }
+    .ch-status { font-size: 12px; color: var(--sub); margin-left: 8px; font-weight: normal; }
+    .btn-icon { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; cursor: pointer; color: var(--sub); }
+    .btn-icon:hover { background: #1f232e; color: #fff; }
     
-    /* 消息列表 */
-    .msg-list { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-    .msg-row { display: flex; gap: 8px; max-width: 85%; flex-direction: column; }
-    .msg-row.me { align-self: flex-end; align-items: flex-end; }
-    .msg-row.other { align-items: flex-start; }
-    .msg-bubble { padding: 10px 14px; border-radius: 16px; font-size: 15px; line-height: 1.4; word-wrap: break-word; max-width: 100%; }
-    .me .msg-bubble { background: var(--primary); color: #fff; border-bottom-right-radius: 2px; }
-    .other .msg-bubble { background: var(--bubble-other); color: #e5e7eb; border-bottom-left-radius: 2px; }
-    .msg-meta { font-size: 10px; opacity: 0.5; margin-top: 4px; padding: 0 4px; }
+    .msg-list { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth; }
+    .msg-row { display: flex; gap: 8px; max-width: 85%; }
+    .msg-row.me { align-self: flex-end; flex-direction: row-reverse; }
+    .msg-bubble { padding: 10px 14px; border-radius: 16px; font-size: 15px; line-height: 1.4; word-break: break-word; position: relative; }
+    .msg-row.me .msg-bubble { background: var(--primary); color: #fff; border-bottom-right-radius: 4px; }
+    .msg-row.other .msg-bubble { background: var(--bubble-other); color: #e5e7eb; border-bottom-left-radius: 4px; }
+    .msg-meta { font-size: 10px; opacity: 0.6; margin-top: 4px; text-align: right; }
     .sys-msg { align-self: center; background: rgba(255,255,255,0.05); padding: 4px 12px; border-radius: 99px; font-size: 12px; color: var(--sub); }
     
     /* 发送区 */
     .send-box { min-height: 60px; border-top: 1px solid var(--line); background: var(--panel); padding: 10px; display: flex; align-items: flex-end; gap: 10px; }
     .input-wrap { flex: 1; background: #0a0c10; border: 1px solid #2b3040; border-radius: 20px; min-height: 40px; display: flex; align-items: center; padding: 4px 12px; }
-    #editor { flex: 1; max-height: 100px; overflow-y: auto; outline: none; font-size: 15px; line-height: 1.4; color: #fff; }
+    #editor { flex: 1; max-height: 100px; overflow-y: auto; outline: none; font-size: 15px; line-height: 1.4; }
     #editor:empty:before { content: '发送消息...'; color: #555; }
-    .send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--primary); color: #fff; border: none; display: grid; place-items: center; flex-shrink: 0; cursor: pointer; }
+    .send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--primary); color: #fff; border: none; display: grid; place-items: center; flex-shrink: 0; cursor: pointer; transition: .2s; }
     
-    /* 移动端 */
+    /* 移动端适配 */
     @media (max-width: 768px) {
       .sidebar { position: absolute; height: 100%; transform: translateX(0); transition: transform .3s; width: 100%; }
       .sidebar.hidden { transform: translateX(-100%); }
@@ -75,20 +76,19 @@
       .sidebar.hidden { display: flex; transform: none; }
     }
 
-    /* 设置弹窗 */
+    /* 设置面板 */
     #settings-panel { position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 99; display: none; place-items: center; }
     .settings-box { width: 90%; max-width: 400px; background: #13151b; border-radius: 16px; padding: 20px; border: 1px solid var(--line); }
     .st-input { width: 100%; padding: 10px; background: #0a0c10; border: 1px solid #2b3040; border-radius: 8px; color: #fff; font-size: 16px; margin-bottom: 15px; }
     .st-btn { width: 100%; padding: 12px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; background: #2a7cff; color: #fff; }
     
     .mini-log { position: absolute; top: 60px; right: 10px; width: 200px; height: 120px; background: rgba(0,0,0,0.8); color: #0f0; font-size: 10px; padding: 8px; border-radius: 8px; overflow: auto; pointer-events: none; opacity: 0.5; z-index: 10; display: none; }
-    .red-dot { display:inline-block; width:8px; height:8px; background:#f00; border-radius:50%; margin-left:5px; }
+    .red-dot { display:inline-block; width:8px; height:8px; background:#f00; border-radius:50%; margin-left:5px; box-shadow:0 0 5px #f00; }
   </style>
 </head>
 <body>
 
 <div class="app-shell">
-  <!-- 侧边栏 -->
   <aside class="sidebar" id="sidebar">
     <div class="my-card">
       <div class="my-info">
@@ -97,20 +97,19 @@
           <div class="my-name" id="myNick">-</div>
           <div class="status-row">
             <div class="dot" id="statusDot"></div>
-            <span id="statusText">连接中...</span>
+            <span id="statusText">离线</span>
           </div>
         </div>
         <div class="btn-icon" id="btnSettings">⚙️</div>
       </div>
       <div class="status-row" style="justify-content:space-between">
-        <span>ID: <span id="myId">...</span></span>
-        <span id="onlineCount">0 连接</span>
+        <span>ID: <span id="myId">-</span></span>
+        <span id="onlineCount">0</span>
       </div>
     </div>
     <div class="contact-list" id="contactList"></div>
   </aside>
 
-  <!-- 聊天区 -->
   <main class="chat-area">
     <header class="chat-header">
       <div style="display:flex;align-items:center">
@@ -137,12 +136,11 @@
   </main>
 </div>
 
-<!-- 设置 -->
 <div id="settings-panel">
   <div class="settings-box">
     <h3 style="margin-top:0">设置</h3>
     <input class="st-input" id="iptNick" placeholder="我的昵称">
-    <input class="st-input" id="iptPeer" placeholder="添加节点 ID">
+    <input class="st-input" id="iptPeer" placeholder="添加节点 ID (可选)">
     <button class="st-btn" id="btnSave">保存</button>
     <button class="st-btn" id="btnCloseSettings" style="margin-top:10px;background:transparent;color:#666">关闭</button>
   </div>
