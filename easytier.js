@@ -4,18 +4,11 @@
 // ===================== 配置 =====================
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
-  config: { 
-    iceServers: [
-      {urls:'stun:stun.l.google.com:19302'},
-      {urls:'stun:stun1.l.google.com:19302'}
-    ] 
-  },
+  config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 0
 };
-const MAX_NEIGHBORS = 50; 
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3']; 
 const CHUNK_SIZE = 64 * 1024;
-const PING_INTERVAL = 5000; // 5秒心跳
 
 // ===================== 核心 =====================
 const app = {
@@ -23,145 +16,136 @@ const app = {
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*10000),
   peer: null,
   conns: {}, 
-  knownPeers: new Set(), 
+  
+  // 数据库：名字为 Key
+  contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'), 
+  msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'),
+  
   seenMsgs: new Set(),
   fileChunks: {},
   isSeed: false,
-  lastActivity: Date.now(), // 最后活跃时间
 
   log(s) {
     const el = document.getElementById('miniLog');
-    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 300);
+    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 200);
   },
 
   init() {
     this.start();
     
-    // 定时维护
+    // 守护进程
     setInterval(() => {
       this.cleanup();
       this.exchangePeers();
-      this.checkNetworkHealth();
-      this.sendHeartbeat(); // 发送心跳
-    }, PING_INTERVAL);
+      // 掉线重连
+      if(Object.keys(this.conns).length === 0 && !this.isSeed) this.start();
+    }, 5000);
     
     setInterval(() => this.seenMsgs.clear(), 60000);
-
-    // 监听页面可见性（后台回来强制检查）
+    
+    // 🔥 唤醒暴力重连：彻底解决切后台“假死”问题
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        this.log('👀 页面唤醒，检查连接...');
-        this.checkNetworkHealth(true); // 强制检查
-        // 如果 Peer 断了，重连 Peer
-        if (!this.peer || this.peer.disconnected) {
-          this.log('🔄 Peer断开，重连中...');
-          this.peer.reconnect();
+        this.log('⚡ 唤醒检查...');
+        this.requestWakeLock();
+        // 如果信令断了，或者连接数归零，强制重启
+        if (!this.peer || this.peer.disconnected || Object.keys(this.conns).length === 0) {
+           this.start();
         }
+        // 主动 Ping 所有连接，唤醒死链
+        Object.values(this.conns).forEach(c => { try{c.send({t:'PING'})}catch(e){} });
       }
     });
   },
 
   start() {
-    if(this.peer) return;
-    const savedId = localStorage.getItem('myPeerId');
-    this.initPeer(savedId, false);
+    if(this.peer && !this.peer.destroyed) return;
+    const randIndex = Math.floor(Math.random() * SEEDS.length);
+    this.initPeer(SEEDS[randIndex], true); 
   },
 
   initPeer(id, trySeed = false) {
     try {
-      if(this.peer) this.peer.destroy(); // 确保旧的销毁
+      const p = new Peer(trySeed ? id : undefined, CONFIG);
       
-      const p = new Peer(id, CONFIG);
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
         this.isSeed = SEEDS.includes(myId);
-        localStorage.setItem('myPeerId', myId);
-        this.log(`✅ 就绪: ${myId.slice(0,6)}`);
         ui.updateSelf();
+        this.log(`✅ 上线: ${this.myName} (${myId.slice(0,5)})`);
+        
         SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
+        // 重新连接所有熟人（取最新的 ID）
+        Object.values(this.contacts).forEach(c => {
+          if(c.id && c.id !== myId) this.connectTo(c.id);
+        });
+        
+        this.requestWakeLock();
       });
-      
+
       p.on('error', err => {
-        this.log('Peer ERR: ' + err.type);
-        if(err.type === 'unavailable-id') this.initPeer(undefined, false);
-        if(err.type === 'disconnected' || err.type === 'network') {
-            setTimeout(() => this.peer.reconnect(), 2000);
-        }
-      });
-      
-      p.on('disconnected', () => {
-          this.log('🔌 Peer掉线，尝试重连...');
-          setTimeout(() => { if(this.peer) this.peer.reconnect(); }, 1000);
+        if(err.type === 'unavailable-id' && trySeed) this.initPeer(undefined, false);
       });
 
       p.on('connection', conn => this.handleConn(conn, true));
-    } catch(e) { this.log('ERR: '+e); }
+    } catch(e) { this.log('ERR:'+e); }
   },
 
   connectTo(targetId) {
     if(targetId === this.myId || this.conns[targetId]) return;
-    if(Object.keys(this.conns).length >= MAX_NEIGHBORS) return;
     const conn = this.peer.connect(targetId, {reliable: true});
     this.handleConn(conn, false);
   },
 
   handleConn(conn, isIncoming) {
     const pid = conn.peer;
-    
-    // 绑定事件前先解绑旧的（防止重复）
-    conn.removeAllListeners && conn.removeAllListeners();
-
     conn.on('open', () => {
       this.conns[pid] = conn;
-      conn.lastPing = Date.now(); // 初始化心跳时间
-      this.knownPeers.add(pid);
       ui.renderList();
-      
-      // 握手
       conn.send({t: 'HELLO', n: this.myName});
-      const list = [...this.knownPeers, ...Object.keys(this.conns)];
-      conn.send({t: 'PEER_EX', list: list});
-      
-      if(ui.activeChat === pid) ui.switchChat(pid);
+      // Gossip
+      const list = Object.values(this.contacts).map(c => c.id).filter(id => id);
+      conn.send({t: 'PEER_EX', list});
     });
 
     conn.on('data', d => {
-      conn.lastPing = Date.now(); // 收到任何数据都算活的
+      if(d.t === 'PING') return; // 心跳包
       
-      if(d.t === 'PING') {
-          conn.send({t: 'PONG'}); // 回应心跳
-          return;
-      }
-      if(d.t === 'PONG') return;
-
-      if(d.t === 'HELLO') { conn.label = d.n; ui.renderList(); }
-      
-      if(d.t === 'PEER_EX' && Array.isArray(d.list)) {
-        d.list.forEach(id => {
-          this.knownPeers.add(id);
-          if (Object.keys(this.conns).length < 10 && id !== this.myId) this.connectTo(id);
-        });
+      if(d.t === 'HELLO') { 
+        conn.label = d.n; 
+        // 更新名册：名字 -> 最新 ID
+        this.contacts[d.n] = { id: pid, lastSeen: Date.now() };
+        localStorage.setItem('p1_contacts', JSON.stringify(this.contacts));
         ui.renderList();
+        // 如果当前正在和该人聊天，刷新标题
+        if(ui.activeChatName === d.n) ui.switchChat(d.n, pid);
+      }
+      
+      if(d.t === 'PEER_EX') {
+        d.list.forEach(id => {
+          if(id !== this.myId && !this.conns[id] && Object.keys(this.conns).length < 15) this.connectTo(id);
+        });
       }
       
       if(d.t === 'MSG') {
         if(this.seenMsgs.has(d.id)) return; 
         this.seenMsgs.add(d.id);
-        if(d.target === 'all' || d.target === this.myId) {
-          const isPrivate = d.target !== 'all';
-          if( (ui.activeChat === 'all' && !isPrivate) || (ui.activeChat === d.from && isPrivate) ) {
-             ui.appendMsg(d.sender, d.txt, false, false, d.isHtml);
-          } else if (isPrivate) {
-             this.log(`🔔 收到 ${d.sender} 的私信`);
-          }
+        
+        const chatKey = d.target === 'all' ? 'all' : d.senderName;
+        
+        if(d.target === 'all' || d.target === this.myName) { 
+           this.saveMsg(chatKey, d.txt, false, d.senderName, d.isHtml);
         }
+        
         if(d.target === 'all') this.flood(d, pid); 
       }
       
+      // 文件接收
       if(d.t === 'FILE_START') {
         this.fileChunks[d.fid] = { meta: d.meta, buffer: [], received: 0 };
-        if(ui.activeChat === pid) ui.appendMsg('系统', `正在接收 ${d.meta.name}...`, false, true);
+        const name = d.senderName || conn.label || '未知';
+        ui.appendMsg(name, `📥 正在接收 ${d.meta.name}...`, false, true);
       }
       if(d.t === 'FILE_CHUNK') {
         const f = this.fileChunks[d.fid];
@@ -171,183 +155,236 @@ const app = {
           if(f.received >= f.meta.size) {
             const blob = new Blob(f.buffer, {type: f.meta.type});
             const url = URL.createObjectURL(blob);
-            if(ui.activeChat === pid) ui.appendMsg(conn.label, `<a href="${url}" download="${f.meta.name}" style="color:#4ade80">📄 ${f.meta.name}</a>`, false, false, true);
+            const html = `<div class="file-card"><a href="${url}" download="${f.meta.name}" style="color:#fff">📄 ${f.meta.name} (下载)</a></div>`;
+            
+            const name = d.senderName || conn.label;
+            const chatKey = (ui.activeChatName === '公共频道') ? 'all' : name;
+            this.saveMsg(chatKey, html, false, name, true);
             delete this.fileChunks[d.fid];
           }
         }
       }
     });
 
-    const closeConn = () => this.dropPeer(pid);
-    conn.on('close', closeConn);
-    conn.on('error', closeConn);
+    conn.on('close', () => this.dropPeer(pid));
+    conn.on('error', () => this.dropPeer(pid));
   },
 
   dropPeer(pid) {
-    if(this.conns[pid]) {
-        this.conns[pid].close(); // 确保彻底关闭
-        delete this.conns[pid];
-        ui.renderList();
-    }
+    delete this.conns[pid];
+    ui.renderList();
   },
 
   flood(packet, excludeId) {
     Object.keys(this.conns).forEach(pid => {
-      if(pid !== excludeId) {
-          this.sendToConn(this.conns[pid], packet);
+      if(pid !== excludeId && this.conns[pid].open) {
+        try { this.conns[pid].send(packet); } catch(e){}
       }
     });
   },
 
-  // 统一发送封装：带状态检查
-  sendToConn(conn, packet) {
-      if (conn && conn.open) {
-          try {
-              conn.send(packet);
-          } catch (e) {
-              console.error('Send fail:', e);
-              this.dropPeer(conn.peer); // 发送失败直接踢掉重连
-          }
-      }
-  },
-
-  sendText(txt, targetId) {
+  sendText(txt, targetName) { 
     const id = Date.now() + Math.random().toString(36);
-    const packet = {t: 'MSG', id, txt, sender: this.myName, target: targetId};
+    const packet = {t: 'MSG', id, txt, senderName: this.myName, target: targetName === '公共频道' ? 'all' : targetName};
     this.seenMsgs.add(id);
-    ui.appendMsg('我', txt, true);
-    if(targetId === 'all') {
+    
+    const storageKey = targetName === '公共频道' ? 'all' : targetName;
+    this.saveMsg(storageKey, txt, true, '我');
+    
+    if(targetName === '公共频道') {
       this.flood(packet, null);
     } else {
+      // 私聊：查 ID
+      const contact = this.contacts[targetName];
+      const targetId = contact ? contact.id : null;
       const c = this.conns[targetId];
+      
       if(c && c.open) {
-          this.sendToConn(c, packet);
+        c.send(packet);
       } else {
-          alert('连接已断开，尝试重连中...');
-          this.connectTo(targetId); // 尝试自动重连
+        // 尝试回拨
+        if(targetId) this.connectTo(targetId);
+        ui.appendMsg('系统', '对方暂时离线，正在呼叫...', true, true);
+        // 稍微延迟重试一次
+        setTimeout(() => {
+           if(this.conns[targetId]) this.conns[targetId].send(packet);
+        }, 2000);
       }
     }
   },
 
-  sendFile(file, targetId) {
-    const c = this.conns[targetId];
-    if(!c || !c.open) { alert('未建立直连，无法传文件'); return; }
+  saveMsg(chatKey, txt, isMe, senderName, isHtml) {
+    if(!this.msgs[chatKey]) this.msgs[chatKey] = [];
+    const msgObj = { txt, me: isMe, name: senderName, html: isHtml, time: Date.now() };
+    this.msgs[chatKey].push(msgObj);
+    if(this.msgs[chatKey].length > 50) this.msgs[chatKey].shift();
+    localStorage.setItem('p1_msgs', JSON.stringify(this.msgs));
+    
+    if(ui.activeChatName === chatKey || (chatKey === 'all' && ui.activeChatName === '公共频道')) {
+      ui.appendMsg(senderName, txt, isMe, false, isHtml);
+    } else {
+      ui.setUnread(chatKey, true);
+    }
+  },
+
+  sendFile(file, targetName) {
     const fid = Date.now() + '-' + Math.random();
-    c.send({t: 'FILE_START', fid, meta: {name: file.name, size: file.size, type: file.type}});
+    const meta = {name: file.name, size: file.size, type: file.type};
+    
+    const html = `<div class="file-card">📄 ${file.name} (已发送)</div>`;
+    const storageKey = targetName === '公共频道' ? 'all' : targetName;
+    this.saveMsg(storageKey, html, true, '我', true);
+
+    let targets = [];
+    if(targetName === '公共频道') targets = Object.values(this.conns).filter(c => c.open);
+    else {
+      const cid = this.contacts[targetName]?.id;
+      if(this.conns[cid]) targets = [this.conns[cid]];
+    }
+
+    if(targets.length === 0) return;
+
+    targets.forEach(c => c.send({t: 'FILE_START', fid, meta, senderName: this.myName}));
+
     const reader = new FileReader();
     let offset = 0;
     reader.onload = e => {
-      c.send({t: 'FILE_CHUNK', fid, data: e.target.result});
-      offset += e.target.result.byteLength;
-      if(offset < file.size) readNext();
-      else ui.appendMsg('系统', `文件 ${file.name} 发送完毕`, true, true);
+      const chunk = e.target.result;
+      targets.forEach(c => c.send({t: 'FILE_CHUNK', fid, data: chunk, senderName: this.myName, done: (offset+chunk.byteLength >= file.size)}));
+      offset += chunk.byteLength;
+      if(offset < file.size) setTimeout(readNext, 5);
     };
     const readNext = () => reader.readAsArrayBuffer(file.slice(offset, offset + CHUNK_SIZE));
     readNext();
   },
 
   cleanup() {
-    // 清理死链接
-    Object.keys(this.conns).forEach(pid => {
-      const c = this.conns[pid];
-      // 如果超过 15 秒没心跳（或者没数据），且连接状态看着是 open，可能假死
-      if (c.lastPing && (Date.now() - c.lastPing > 15000)) {
-          this.log(`💀 ${pid.slice(0,6)} 心跳超时，断开`);
-          this.dropPeer(pid);
-      }
-      if(!c.open) this.dropPeer(pid);
-    });
-  },
-
-  // 发送心跳保活
-  sendHeartbeat() {
-      Object.values(this.conns).forEach(conn => {
-          if(conn.open) conn.send({t: 'PING'});
-      });
+    Object.keys(this.conns).forEach(pid => { if(!this.conns[pid].open) this.dropPeer(pid); });
   },
 
   exchangePeers() {
-    const list = [...Object.keys(this.conns)].slice(0, 20);
-    const packet = {t: 'PEER_EX', list: list};
+    const list = Object.values(this.contacts).map(c => c.id).filter(id => id);
+    const packet = {t: 'PEER_EX', list};
     Object.values(this.conns).forEach(c => { if(c.open) c.send(packet); });
   },
   
-  checkNetworkHealth(force = false) {
-    // 如果完全没连接，或者强制检查时
-    if ((Object.keys(this.conns).length === 0 && !this.isSeed) || force) {
-       SEEDS.forEach(s => this.connectTo(s));
-    }
+  remember(pid) {
+    // 这里只做简单的 ID 记录，名字绑定在 HELLO 消息里做
+  },
+  
+  requestWakeLock() {
+    if('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(()=>{});
   }
 };
 
 // ===================== UI =====================
 const ui = {
-  activeChat: 'all',
+  activeChatName: '公共频道', 
+  activeChatId: null,       
+  unread: {}, 
 
   init() {
-    document.getElementById('btnSend').onclick = () => {
-      const el = document.getElementById('editor');
-      if(el.innerText.trim()) {
-        app.sendText(el.innerText.trim(), this.activeChat);
-        el.innerText = '';
-      }
-    };
-    
-    document.getElementById('btnSave').onclick = () => {
-      const nick = document.getElementById('iptNick').value;
-      if(nick) {
-        localStorage.setItem('nickname', nick);
-        location.reload();
-      }
-      const peer = document.getElementById('iptPeer').value;
-      if(peer) {
-        app.connectTo(peer);
-        alert('尝试连接: ' + peer);
-        this.toggleSettings(false);
-      }
-    };
-    
-    document.getElementById('fileInput').onchange = (e) => {
-      if(e.target.files[0]) app.sendFile(e.target.files[0], this.activeChat);
-    };
-    
-    document.getElementById('btnBack').onclick = () => {
-      document.getElementById('sidebar').classList.remove('hidden');
-    };
-    document.getElementById('btnToggleLog').onclick = () => {
-      const el = document.getElementById('miniLog');
-      el.style.display = el.style.display==='block'?'none':'block';
-    };
-    
-    document.getElementById('iptNick').value = localStorage.getItem('nickname') || '';
-    
-    this.updateSelf();
-    this.renderList();
-  },
+    const btnSend = document.getElementById('btnSend');
+    // 安全绑定：防止 DOM 还没加载完
+    if(btnSend) {
+      btnSend.onclick = () => {
+        const el = document.getElementById('editor');
+        if(el.innerText.trim()) {
+          app.sendText(el.innerText.trim(), this.activeChatName);
+          el.innerText = '';
+        }
+      };
+    }
 
-  toggleSettings(show) {
-    document.getElementById('settings-panel').style.display = show ? 'grid' : 'none';
-  },
-  
-  triggerFile() {
-    if(this.activeChat === 'all') { alert('请先进入私聊再发文件'); return; }
-    document.getElementById('fileInput').click();
+    const btnFile = document.getElementById('btnFile');
+    const fileInput = document.getElementById('fileInput');
+    if(btnFile) {
+      btnFile.onclick = () => fileInput.click();
+      fileInput.onchange = (e) => {
+        if(e.target.files[0]) {
+          app.sendFile(e.target.files[0], this.activeChatName);
+          e.target.value = '';
+        }
+      };
+    }
+
+    // 设置面板
+    const btnSet = document.getElementById('btnSettings');
+    const panel = document.getElementById('settings-panel');
+    const btnSave = document.getElementById('btnSave');
+    if(btnSet) {
+      btnSet.onclick = () => {
+        document.getElementById('iptNick').value = app.myName;
+        panel.style.display = 'grid';
+      };
+      document.getElementById('btnCloseSettings').onclick = () => panel.style.display='none';
+      btnSave.onclick = () => {
+        const newName = document.getElementById('iptNick').value.trim();
+        if(newName) {
+          app.myName = newName;
+          localStorage.setItem('nickname', newName);
+          ui.updateSelf();
+          Object.values(app.conns).forEach(c => c.send({t:'HELLO', n: newName}));
+        }
+        const peer = document.getElementById('iptPeer').value.trim();
+        if(peer) app.connectTo(peer);
+        panel.style.display = 'none';
+      };
+    }
+
+    document.getElementById('btnBack').onclick = () => document.getElementById('sidebar').classList.remove('hidden');
+    document.getElementById('btnToggleLog').onclick = () => {
+       const el = document.getElementById('miniLog');
+       el.style.display = el.style.display==='block' ? 'none' : 'block';
+    };
+
+    // 注入样式
+    if(!document.getElementById('dynamic-style')) {
+      const s = document.createElement('style');
+      s.id = 'dynamic-style';
+      s.innerHTML = `.file-card { background: #232634; padding: 8px; border-radius: 8px; display: flex; align-items: center; gap: 8px; min-width: 180px; color: #fff; }`;
+      document.head.appendChild(s);
+    }
+
+    this.updateSelf();
+    this.switchChat('公共频道', null);
   },
 
   updateSelf() {
     document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,6) : '...';
-    document.getElementById('statusText').innerText = app.isSeed ? '👑 入口' : '✅ 在线';
+    document.getElementById('myNick').innerText = app.myName;
+    document.getElementById('statusText').innerText = app.isSeed ? '入口节点' : '普通节点';
     document.getElementById('statusDot').className = 'dot ' + (app.myId ? 'online':'');
   },
 
-  switchChat(pid) {
-    this.activeChat = pid;
-    const name = pid === 'all' ? '公共频道' : (app.conns[pid]?.label || pid.slice(0,6));
+  switchChat(name, id) {
+    this.activeChatName = name;
+    this.activeChatId = id;
+    this.unread[name] = false; 
+    
+    if(id && !app.conns[id]) app.connectTo(id);
+
     document.getElementById('chatTitle').innerText = name;
-    document.getElementById('chatStatus').innerText = pid === 'all' ? '全网广播' : (app.conns[pid]?'直连中':'未连接');
-    document.getElementById('msgList').innerHTML = '<div class="sys-msg">切换到会话</div>';
+    
+    // 加载历史
+    const key = name === '公共频道' ? 'all' : name;
+    const msgBox = document.getElementById('msgList');
+    msgBox.innerHTML = ''; 
+    const history = app.msgs[key] || [];
+    
+    if(history.length === 0) {
+       msgBox.innerHTML = '<div class="sys-msg">暂无消息</div>';
+    } else {
+       history.forEach(m => this.appendMsg(m.name, m.txt, m.me, false, m.html));
+    }
+    
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
     this.renderList();
+  },
+  
+  setUnread(name, hasUnread) {
+    this.unread[name] = hasUnread;
+    this.renderList(); 
   },
 
   renderList() {
@@ -356,40 +393,36 @@ const ui = {
     document.getElementById('onlineCount').innerText = count + ' 连接';
 
     let html = `
-      <div class="contact-item ${this.activeChat==='all'?'active':''}" onclick="ui.switchChat('all')">
+      <div class="contact-item ${this.activeChatName==='公共频道'?'active':''}" onclick="ui.switchChat('公共频道', null)">
         <div class="avatar" style="background:#2a7cff">群</div>
         <div class="c-info">
-          <div class="c-name">公共频道</div>
-          <div class="c-msg">已与 ${count} 个设备互联</div>
+          <div class="c-name">公共频道 ${this.unread['all']?'🔴':''}</div>
         </div>
       </div>
     `;
     
-    Object.keys(app.conns).forEach(pid => {
-      const c = app.conns[pid];
+    const allNames = new Set([...Object.keys(app.contacts), ...Object.keys(app.conns).map(pid => app.conns[pid].label)]);
+    
+    allNames.forEach(name => {
+      if(!name || name === app.myName) return;
+      
+      let id = null;
+      const onlinePid = Object.keys(app.conns).find(pid => app.conns[pid].label === name);
+      if(onlinePid) id = onlinePid;
+      else if(app.contacts[name]) id = app.contacts[name].id;
+      
+      const isOnline = !!onlinePid;
+      const hasRed = this.unread[name] ? '🔴' : '';
+      
       html += `
-        <div class="contact-item ${this.activeChat===pid?'active':''}" onclick="ui.switchChat('${pid}')">
-          <div class="avatar" style="background:#333">${(c.label||pid)[0]}</div>
+        <div class="contact-item ${this.activeChatName===name?'active':''}" onclick="ui.switchChat('${name}', '${id}')">
+          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${name[0]}</div>
           <div class="c-info">
-            <div class="c-name">${c.label || pid.slice(0,6)}</div>
-            <div class="c-msg" style="color:#22c55e">● 已连接</div>
+            <div class="c-name">${name} ${hasRed}</div>
+            <div class="c-time" style="color:${isOnline?'#4ade80':'#666'}">${isOnline?'在线':'离线'}</div>
           </div>
         </div>
       `;
-    });
-
-    app.knownPeers.forEach(pid => {
-      if(!app.conns[pid] && pid !== app.myId) {
-        html += `
-          <div class="contact-item" style="opacity:0.5; cursor:default">
-            <div class="avatar" style="background:#666">?</div>
-            <div class="c-info">
-              <div class="c-name">${pid.slice(0,6)}</div>
-              <div class="c-msg">离线 / 未连接</div>
-            </div>
-          </div>
-        `;
-      }
     });
 
     list.innerHTML = html;
@@ -397,6 +430,8 @@ const ui = {
 
   appendMsg(name, txt, isMe, isSys, isHtml) {
     const box = document.getElementById('msgList');
+    if(box.childElementCount > 100) box.removeChild(box.firstElementChild);
+
     const d = document.createElement('div');
     if(isSys) {
       d.className = 'sys-msg';
@@ -417,7 +452,7 @@ const ui = {
 
 window.app = app;
 window.ui = ui;
-ui.init();
 app.init();
+setTimeout(() => ui.init(), 500); 
 
 })();
