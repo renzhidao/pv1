@@ -1,27 +1,25 @@
 (function(){
 'use strict';
 
-// ===================== 全网全通配置 =====================
+// ===================== 配置 =====================
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 0
 };
-
-// 🔥 扩容：允许每台设备最多维持 50 个连接
 const MAX_NEIGHBORS = 50; 
-// 3 个固定入口，保证无论何时都有门能进
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3']; 
+const CHUNK_SIZE = 64 * 1024;
 
-// ===================== 核心逻辑 =====================
+// ===================== 核心 =====================
 const app = {
   myId: '',
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*10000),
   peer: null,
-  conns: {}, // 活跃连接
-  knownPeers: new Set(), // 通讯录
-  seenMsgs: new Set(),   // 消息去重
-  
+  conns: {}, 
+  knownPeers: new Set(), 
+  seenMsgs: new Set(),
+  fileChunks: {},
   isSeed: false,
 
   log(s) {
@@ -31,119 +29,131 @@ const app = {
 
   init() {
     this.start();
-    
-    // 🕸️ 5秒一次：清理死链、交换通讯录、尝试上位
     setInterval(() => {
       this.cleanup();
       this.exchangePeers();
       this.checkNetworkHealth();
     }, 5000);
-    
-    // 1分钟一次：清理消息指纹
     setInterval(() => this.seenMsgs.clear(), 60000);
   },
 
   start() {
     if(this.peer) return;
-    
-    // 启动时，先随机尝试抢一个种子位，抢不到就做普通人
-    // 这样能让多台设备自动分散承担“入口”责任
     const randIndex = Math.floor(Math.random() * SEEDS.length);
-    
-    // 尝试以种子身份启动
     this.initPeer(SEEDS[randIndex], true); 
   },
 
   initPeer(id, trySeed = false) {
     try {
-      // 如果 trySeed 为 false，则 id 为 undefined (自动随机)
       const p = new Peer(trySeed ? id : undefined, CONFIG);
-      
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
         this.isSeed = SEEDS.includes(myId);
-        
-        this.log(`✅ 就绪: ${myId.slice(0,6)} ${this.isSeed ? '(入口)' : ''}`);
+        this.log(`✅ 就绪: ${myId.slice(0,6)}`);
         ui.updateSelf();
-        
-        // 🔥 关键：无论我是谁，我都去连那 3 个固定入口
-        // 这样种子之间会互连，普通人也会连种子，瞬间结网
-        SEEDS.forEach(s => { 
-          if(s !== myId) this.connectTo(s); 
-        });
+        SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
       });
-
       p.on('error', err => {
-        if(err.type === 'unavailable-id') {
-          // 哎呀，这个种子位被人占了
-          if (trySeed) {
-            // 那我就做普通人吧 (递归调用，id=undefined)
-            this.log('入口已满，以普通节点加入...');
-            this.initPeer(undefined, false);
-          }
-        } else {
-          // this.log(`Err: ${err.type}`);
-        }
+        if(err.type === 'unavailable-id' && trySeed) this.initPeer(undefined, false);
       });
-
       p.on('connection', conn => this.handleConn(conn, true));
-    } catch(e) {
-      this.log('启动异常: ' + e);
-    }
+    } catch(e) { this.log('ERR: '+e); }
   },
 
-  // 主动去连别人
   connectTo(targetId) {
     if(targetId === this.myId || this.conns[targetId]) return;
     if(Object.keys(this.conns).length >= MAX_NEIGHBORS) return;
-    
     const conn = this.peer.connect(targetId, {reliable: true});
     this.handleConn(conn, false);
   },
 
-  // 处理连接（无论是别人连我，还是我连别人）
+  requestDirectConnection(targetId) {
+    if(this.conns[targetId] && this.conns[targetId].open) {
+      ui.switchChat(targetId); // 已经连了，直接切UI
+      return;
+    }
+    this.log(`📡 呼叫反连: ${targetId.slice(0,6)}`);
+    const packet = { t: 'CALL_ME', target: targetId, from: this.myId, id: Date.now()+Math.random() };
+    this.flood(packet, null);
+    this.connectTo(targetId);
+    
+    // UI 提示
+    alert('正在呼叫对方建立直连通道，请稍候...');
+  },
+
   handleConn(conn, isIncoming) {
     const pid = conn.peer;
-    
     conn.on('open', () => {
       this.conns[pid] = conn;
       this.knownPeers.add(pid);
       ui.renderList();
-      
-      // 1. 握手：报名字
       conn.send({t: 'HELLO', n: this.myName});
-      
-      // 2. 互换资源：把我认识的所有人告诉你
       const list = [...this.knownPeers, ...Object.keys(this.conns)];
       conn.send({t: 'PEER_EX', list: list});
+      
+      // 如果刚好在私聊这个人，更新标题状态
+      if(ui.activeChat === pid) ui.switchChat(pid);
     });
 
     conn.on('data', d => {
-      // 更新名字
-      if(d.t === 'HELLO') {
-        conn.label = d.n;
-        ui.renderList();
-      }
+      if(d.t === 'HELLO') { conn.label = d.n; ui.renderList(); }
       
-      // 收到通讯录 -> 尝试扩展连接
       if(d.t === 'PEER_EX' && Array.isArray(d.list)) {
         d.list.forEach(id => {
           this.knownPeers.add(id);
-          // 如果我连接数还很少，就去连这些新朋友
-          if (Object.keys(this.conns).length < 10 && id !== this.myId) {
-            this.connectTo(id);
-          }
+          if (Object.keys(this.conns).length < 10 && id !== this.myId) this.connectTo(id);
         });
+        ui.renderList(); // 刷新列表以显示新发现的潜在节点
       }
       
-      // 收到消息 -> 显示 + 转发
+      if(d.t === 'CALL_ME') {
+        if(d.target === this.myId) {
+          this.log(`📩 反连请求: ${d.from.slice(0,6)}`);
+          this.connectTo(d.from);
+        } else {
+          if(!this.seenMsgs.has(d.id)) { this.seenMsgs.add(d.id); this.flood(d, pid); }
+        }
+      }
+      
       if(d.t === 'MSG') {
-        if(this.seenMsgs.has(d.id)) return; // 重复消息，扔掉
+        if(this.seenMsgs.has(d.id)) return; 
         this.seenMsgs.add(d.id);
         
-        ui.appendMsg(d.sender, d.txt, false);
-        this.flood(d, pid); // 传给其他人
+        // 只有公共消息或私聊给我的消息才显示
+        if(d.target === 'all' || d.target === this.myId) {
+          // 如果是私聊，要在 UI 上区分
+          const isPrivate = d.target !== 'all';
+          // 如果我在公共频道，只显示公共消息；如果我在私聊，只显示私聊
+          if( (ui.activeChat === 'all' && !isPrivate) || (ui.activeChat === d.from && isPrivate) ) {
+             ui.appendMsg(d.sender, d.txt, false, false, d.isHtml);
+          } else if (isPrivate) {
+             // 收到私聊但没打开窗口：这里简单弹个日志
+             this.log(`🔔 收到 ${d.sender} 的私信`);
+          }
+        }
+        
+        // 转发 (只转发公共消息)
+        if(d.target === 'all') this.flood(d, pid); 
+      }
+      
+      // 文件逻辑
+      if(d.t === 'FILE_START') {
+        this.fileChunks[d.fid] = { meta: d.meta, buffer: [], received: 0 };
+        if(ui.activeChat === pid) ui.appendMsg('系统', `正在接收 ${d.meta.name}...`, false, true);
+      }
+      if(d.t === 'FILE_CHUNK') {
+        const f = this.fileChunks[d.fid];
+        if(f) {
+          f.buffer.push(d.data);
+          f.received += d.data.byteLength;
+          if(f.received >= f.meta.size) {
+            const blob = new Blob(f.buffer, {type: f.meta.type});
+            const url = URL.createObjectURL(blob);
+            if(ui.activeChat === pid) ui.appendMsg(conn.label, `<a href="${url}" download="${f.meta.name}" style="color:#4ade80">📄 ${f.meta.name}</a>`, false, false, true);
+            delete this.fileChunks[d.fid];
+          }
+        }
       }
     });
 
@@ -156,7 +166,6 @@ const app = {
     ui.renderList();
   },
 
-  // 泛洪转发：像病毒一样扩散消息
   flood(packet, excludeId) {
     Object.keys(this.conns).forEach(pid => {
       if(pid !== excludeId && this.conns[pid].open) {
@@ -165,16 +174,42 @@ const app = {
     });
   },
 
-  sendText(txt) {
+  sendText(txt, targetId) {
     const id = Date.now() + Math.random().toString(36);
-    const packet = {t: 'MSG', id, txt, sender: this.myName};
+    const packet = {t: 'MSG', id, txt, sender: this.myName, target: targetId};
     this.seenMsgs.add(id);
     
     ui.appendMsg('我', txt, true);
-    this.flood(packet, null); // 发给所有人
+    
+    if(targetId === 'all') {
+      this.flood(packet, null);
+    } else {
+      // 私聊直发
+      const c = this.conns[targetId];
+      if(c && c.open) c.send(packet);
+      else alert('未连接此人');
+    }
   },
 
-  // === 维护 ===
+  sendFile(file, targetId) {
+    const c = this.conns[targetId];
+    if(!c || !c.open) { alert('未建立直连，无法传文件'); return; }
+    
+    const fid = Date.now() + '-' + Math.random();
+    c.send({t: 'FILE_START', fid, meta: {name: file.name, size: file.size, type: file.type}});
+    
+    const reader = new FileReader();
+    let offset = 0;
+    reader.onload = e => {
+      c.send({t: 'FILE_CHUNK', fid, data: e.target.result});
+      offset += e.target.result.byteLength;
+      if(offset < file.size) readNext();
+      else ui.appendMsg('系统', `文件 ${file.name} 发送完毕`, true, true);
+    };
+    const readNext = () => reader.readAsArrayBuffer(file.slice(offset, offset + CHUNK_SIZE));
+    readNext();
+  },
+
   cleanup() {
     Object.keys(this.conns).forEach(pid => {
       if(!this.conns[pid].open) this.dropPeer(pid);
@@ -182,34 +217,40 @@ const app = {
   },
 
   exchangePeers() {
-    // 定期把新认识的人告诉邻居
     const list = [...Object.keys(this.conns)].slice(0, 20);
     const packet = {t: 'PEER_EX', list: list};
-    Object.values(this.conns).forEach(c => {
-      if(c.open) c.send(packet);
-    });
+    Object.values(this.conns).forEach(c => { if(c.open) c.send(packet); });
   },
   
   checkNetworkHealth() {
-    // 保底机制：如果我一个连接都没有，说明我掉队了
-    // 尝试重新做人（重新初始化）
     if (Object.keys(this.conns).length === 0 && !this.isSeed) {
-       // 重新尝试连接种子
        SEEDS.forEach(s => this.connectTo(s));
     }
   }
 };
 
-// ===================== UI =====================
+// ===================== UI (修复点击切换) =====================
 const ui = {
+  activeChat: 'all', // 当前聊天对象
+
   init() {
+    // 发送
     document.getElementById('btnSend').onclick = () => {
       const el = document.getElementById('editor');
       if(el.innerText.trim()) {
-        app.sendText(el.innerText.trim());
+        app.sendText(el.innerText.trim(), this.activeChat);
         el.innerText = '';
       }
     };
+    // 文件
+    document.getElementById('btnFile').onclick = () => {
+      if(this.activeChat === 'all') { alert('请先进入私聊再发文件'); return; }
+      document.getElementById('fileInput').click();
+    };
+    document.getElementById('fileInput').onchange = (e) => {
+      if(e.target.files[0]) app.sendFile(e.target.files[0], this.activeChat);
+    };
+    
     document.getElementById('btnBack').onclick = () => {
       document.getElementById('sidebar').classList.remove('hidden');
     };
@@ -220,9 +261,27 @@ const ui = {
 
   updateSelf() {
     document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,6) : '...';
-    const role = app.isSeed ? '👑 网络入口' : '✅ 互联节点';
-    document.getElementById('statusText').innerText = role;
+    document.getElementById('statusText').innerText = app.isSeed ? '👑 入口' : '✅ 节点';
     document.getElementById('statusDot').className = 'dot ' + (app.myId ? 'online':'');
+  },
+
+  // 🔥 切换聊天窗口
+  switchChat(pid) {
+    this.activeChat = pid;
+    
+    // 更新标题
+    const name = pid === 'all' ? '公共频道' : (app.conns[pid]?.label || pid.slice(0,6));
+    document.getElementById('chatTitle').innerText = name;
+    document.getElementById('chatStatus').innerText = pid === 'all' ? '全网广播' : (app.conns[pid]?'直连中':'未连接');
+    
+    // 清空消息 (暂不加载历史，保证性能)
+    document.getElementById('msgList').innerHTML = '<div class="sys-msg">切换到会话</div>';
+    
+    // 移动端收起侧边栏
+    if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
+    
+    // 高亮更新
+    this.renderList();
   },
 
   renderList() {
@@ -230,8 +289,9 @@ const ui = {
     const count = Object.keys(app.conns).length;
     document.getElementById('onlineCount').innerText = count + ' 连接';
 
-    list.innerHTML = `
-      <div class="contact-item active" onclick="ui.toggleSidebar()">
+    // 1. 公共频道 (始终置顶)
+    let html = `
+      <div class="contact-item ${this.activeChat==='all'?'active':''}" onclick="ui.switchChat('all')">
         <div class="avatar" style="background:#2a7cff">群</div>
         <div class="c-info">
           <div class="c-name">公共频道</div>
@@ -240,39 +300,59 @@ const ui = {
       </div>
     `;
     
+    // 2. 已连接节点
     Object.keys(app.conns).forEach(pid => {
       const c = app.conns[pid];
-      list.innerHTML += `
-        <div class="contact-item">
+      html += `
+        <div class="contact-item ${this.activeChat===pid?'active':''}" onclick="ui.switchChat('${pid}')">
           <div class="avatar" style="background:#333">${(c.label||pid)[0]}</div>
           <div class="c-info">
             <div class="c-name">${c.label || pid.slice(0,6)}</div>
-            <div class="c-msg">${pid.includes('p1-s') ? '引导节点' : '直连'}</div>
+            <div class="c-msg">已直连</div>
           </div>
         </div>
       `;
     });
+
+    // 3. 潜在节点 (我知道但没连上)
+    app.knownPeers.forEach(pid => {
+      if(!app.conns[pid] && pid !== app.myId) {
+        html += `
+          <div class="contact-item" style="opacity:0.5" onclick="app.requestDirectConnection('${pid}')">
+            <div class="avatar" style="background:#666">?</div>
+            <div class="c-info">
+              <div class="c-name">${pid.slice(0,6)}</div>
+              <div class="c-msg">点击呼叫...</div>
+            </div>
+          </div>
+        `;
+      }
+    });
+
+    list.innerHTML = html;
   },
 
-  appendMsg(name, txt, isMe) {
+  appendMsg(name, txt, isMe, isSys, isHtml) {
     const box = document.getElementById('msgList');
     const d = document.createElement('div');
-    d.className = `msg-row ${isMe?'me':'other'}`;
-    d.innerHTML = `
-      <div style="max-width:85%">
-        <div class="msg-bubble">${txt}</div>
-        ${!isMe ? `<div class="msg-meta">${name}</div>` : ''}
-      </div>`;
+    
+    if(isSys) {
+      d.className = 'sys-msg';
+      d.innerText = txt;
+    } else {
+      d.className = `msg-row ${isMe?'me':'other'}`;
+      const content = isHtml ? txt : txt.replace(/</g,'<').replace(/>/g,'>');
+      d.innerHTML = `
+        <div style="max-width:85%">
+          <div class="msg-bubble">${content}</div>
+          ${!isMe ? `<div class="msg-meta">${name}</div>` : ''}
+        </div>`;
+    }
     box.appendChild(d);
     box.scrollTop = box.scrollHeight;
-  },
-  
-  toggleSidebar() {
-    if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
   }
 };
 
-// 启动
 window.app = app;
 window.ui = ui;
 ui.init();
