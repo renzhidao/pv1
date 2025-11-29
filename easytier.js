@@ -1,22 +1,17 @@
 (function(){
 'use strict';
 
+// --- 1. 配置 (回归 v2 经典配置) ---
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 1
 };
 
-const CONST = {
-  SEED_COUNT: 20,
-  MAX_PEERS: 8,
-  MIN_PEERS: 4,
-  PEX_INTERVAL: 10000,
-  TTL: 16,
-  SYNC_LIMIT: 100
-};
+// 房间号生成 (每1小时轮换，比v2的10分钟更稳)
+const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 3600000);
 
-// --- 数据库 (不变) ---
+// --- 2. 数据库 (保留新版功能) ---
 const db = {
   _db: null,
   async init() {
@@ -24,7 +19,7 @@ const db = {
       const req = indexedDB.open('P1_DB', 1);
       req.onupgradeneeded = (e) => {
         const d = e.target.result;
-        if(!d.objectStoreNames.contains('msgs')) d.createObjectStore('msgs', { keyPath: 'id' }).createIndex('ts', 'ts', { unique: false });
+        if(!d.objectStoreNames.contains('msgs')) d.createObjectStore('msgs', { keyPath: 'id' }).createIndex('ts', 'ts');
         if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending', { keyPath: 'id' });
       };
       req.onsuccess = (e) => { this._db = e.target.result; resolve(); };
@@ -38,7 +33,7 @@ const db = {
       tx.oncomplete = () => resolve();
     });
   },
-  async getRecent(limit, target='all', beforeTs = Date.now()) { // 增加 target 过滤
+  async getRecent(limit, target='all', beforeTs = Date.now()) {
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readonly');
       const range = IDBKeyRange.upperBound(beforeTs, true);
@@ -47,58 +42,48 @@ const db = {
       req.onsuccess = (e) => {
         const cursor = e.target.result;
         if(cursor && res.length < limit) {
-          // 过滤逻辑：只取属于当前会话的消息
           const m = cursor.value;
           if (m.target === target || (m.senderId === state.myId && m.target === target) || (target !== 'all' && m.senderId === target && m.target === state.myId)) {
              res.unshift(m);
           }
           cursor.continue();
-        }
-        else resolve(res);
-      };
-    });
-  },
-  async getAfter(limit, afterTs) {
-    return new Promise(resolve => {
-      const tx = this._db.transaction(['msgs'], 'readonly');
-      const range = IDBKeyRange.lowerBound(afterTs, true);
-      const req = tx.objectStore('msgs').index('ts').openCursor(range, 'next');
-      const res = [];
-      req.onsuccess = (e) => {
-        const cursor = e.target.result;
-        if(cursor && res.length < limit) { res.push(cursor.value); cursor.continue(); }
-        else resolve(res);
+        } else resolve(res);
       };
     });
   },
   async addPending(msg) { this._db.transaction(['pending'], 'readwrite').objectStore('pending').put(msg); },
   async getPending() {
-    return new Promise(resolve => {
+    return new Promise(r => {
       const req = this._db.transaction(['pending'], 'readonly').objectStore('pending').getAll();
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => r(req.result);
     });
   },
   async removePending(id) { this._db.transaction(['pending'], 'readwrite').objectStore('pending').delete(id); }
 };
 
+// --- 3. 全局状态 ---
 const state = {
-  myId: null, isSeed: false, peer: null,
-  activeConns: new Map(), knownPeers: new Map(), // Map<ID, {n:name, ts:time}>
-  seenMsgs: new Set(),
-  myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
-  latestTs: 0,
+  myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
+  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
+  peer: null,
+  conns: {}, // v2 风格连接池
+  contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   
-  // UI 状态恢复
-  activeChat: 'all', // 'all' or PeerID
+  // 新版状态
+  activeChat: 'all', 
   activeChatName: '公共频道',
-  unread: {} 
+  unread: {},
+  seenMsgs: new Set(),
+  latestTs: 0,
+  oldestTs: Date.now(),
+  loading: false
 };
 
 const util = {
-  log(s) { 
+  log(s) {
     const el = document.getElementById('logContent');
     if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 2000);
-    console.log(`[P1] ${s}`); 
+    console.log(`[P1] ${s}`);
   },
   uuid() { return Math.random().toString(36).substr(2, 9) + Date.now().toString(36); },
   escape(s) {
@@ -106,102 +91,103 @@ const util = {
   }
 };
 
+// --- 4. 核心逻辑 (v2 连接架构 + v3 数据处理) ---
 const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
+    localStorage.setItem('p1_my_id', state.myId);
+    
     await db.init();
+    await this.loadHistory(20);
     
-    // 先加载公共频道历史
-    await this.refreshHistory();
-
-    const seedId = `p1-seed-${Math.floor(Math.random() * CONST.SEED_COUNT)}`;
-    util.log(`启动中...`);
+    this.startPeer();
     
-    try {
-      await this.startPeer(seedId);
-      state.isSeed = true;
-      util.log(`我是基站: ${seedId}`);
-      // 修复：即使我是基站，也要去连其他基站，防止孤岛
-      this.connectToSeeds();
-    } catch (e) {
-      util.log(`基站被占或不可用(${e.type})，启动普通节点...`);
-      await this.startPeer('u_' + util.uuid());
-      this.connect(seedId); // 连抢占位的那个
-      this.connectToSeeds(); // 多连几个
-    }
-
-    setInterval(() => this.maintainMesh(), 3000);
-    setInterval(() => this.gossipPex(), CONST.PEX_INTERVAL);
-    setInterval(() => this.retryPending(), 5000);
+    // v2 核心循环：定期清理、重连房间、重连联系人
+    setInterval(() => {
+      this.cleanup();
+      const roomId = getRoomId();
+      
+      // 房间连接逻辑 (v2)
+      const hubConn = state.conns[roomId];
+      if (!hubConn || !hubConn.open) this.connectTo(roomId);
+      
+      // 联系人重连 (v2)
+      Object.values(state.contacts).forEach(c => {
+        if(c.id && c.id !== state.myId && (!state.conns[c.id] || !state.conns[c.id].open)) {
+           this.connectTo(c.id);
+        }
+      });
+      
+      this.sendPing();
+      this.retryPending(); // 新版：离线重发
+    }, 5000);
     
     if(window.ui) window.ui.init();
   },
-  
-  connectToSeeds() {
-    // 随机连 3 个其他种子，确保大网互通
-    for(let i=0; i<3; i++) {
-      const s = `p1-seed-${Math.floor(Math.random() * CONST.SEED_COUNT)}`;
-      if(s !== state.myId) this.connect(s);
-    }
-  },
 
-  async refreshHistory() {
-    const msgs = await db.getRecent(50, state.activeChat); // 根据当前聊天对象加载
-    if(window.ui) window.ui.clearMsgs();
-    msgs.forEach(m => {
-      state.seenMsgs.add(m.id);
-      state.latestTs = Math.max(state.latestTs, m.ts);
-      if(window.ui) window.ui.appendMsg(m);
-    });
-  },
-
-  startPeer(id) {
-    return new Promise((resolve, reject) => {
-      const p = new Peer(id, CONFIG);
-      p.on('open', pid => { state.myId = pid; state.peer = p; if(window.ui) window.ui.updateSelf(); resolve(); });
-      // 修复：捕获所有错误，防止 Promise 永远挂起导致“一直连接中”
-      p.on('error', e => { 
-        util.log(`PeerErr: ${e.type}`); 
-        reject(e); 
+  startPeer() {
+    if(state.peer && !state.peer.destroyed) return;
+    util.log(`🚀 启动 (v2.5 融合版)`);
+    
+    try {
+      const p = new Peer(state.myId, CONFIG);
+      p.on('open', id => {
+        state.myId = id;
+        state.peer = p;
+        util.log(`✅ 上线: ${id}`);
+        if(window.ui) window.ui.updateSelf();
+        this.connectTo(getRoomId()); // 立即进房
       });
-      p.on('connection', c => this.handleConn(c));
-    });
+      
+      p.on('error', err => {
+        util.log(`PeerErr: ${err.type}`);
+        // v2 经典容错：如果房间满员/不可用，尝试接管（简单版）
+        if (err.type === 'peer-unavailable' && err.message.includes('room')) {
+           // 这里不做复杂抢主，直接等待或重试，保持 v2 的简单性
+        }
+      });
+      
+      p.on('connection', conn => this.setupConn(conn));
+    } catch(e) { util.log(`Fatal: ${e}`); }
   },
 
-  connect(id) {
-    if(id === state.myId || state.activeConns.has(id) || state.activeConns.size >= CONST.MAX_PEERS) return;
-    try { this.handleConn(state.peer.connect(id, {reliable:true})); } catch(e){}
+  connectTo(id) {
+    if(!state.peer || state.peer.destroyed || id === state.myId || (state.conns[id] && state.conns[id].open)) return;
+    try {
+      const conn = state.peer.connect(id, {reliable: true});
+      this.setupConn(conn);
+    } catch(e){}
   },
 
-  handleConn(conn) {
+  setupConn(conn) {
     conn.on('open', () => {
-      state.activeConns.set(conn.peer, conn);
-      state.knownPeers.set(conn.peer, {n: conn.label || '未知', ts: Date.now()});
-      conn.send({ t: 'HELLO', n: state.myName });
+      state.conns[conn.peer] = conn;
       if(window.ui) window.ui.renderList();
-      this.sendSyncReq(conn.peer, state.latestTs);
-      this.retryPending();
+      conn.send({t: 'HELLO', n: state.myName, id: state.myId});
+      this.exchange(); // v2 交换逻辑
+      this.retryPending(); // 连上人就尝试发离线消息
     });
-    conn.on('data', d => this.handleData(d, conn));
-    conn.on('close', () => this.cleanup(conn.peer));
-    conn.on('error', () => this.cleanup(conn.peer));
-  },
 
-  cleanup(pid) {
-    state.activeConns.delete(pid);
-    if(window.ui) window.ui.renderList();
+    conn.on('data', d => this.handleData(d, conn));
+    conn.on('close', () => { delete state.conns[conn.peer]; if(window.ui) window.ui.renderList(); });
+    conn.on('error', () => { delete state.conns[conn.peer]; if(window.ui) window.ui.renderList(); });
   },
 
   async handleData(d, conn) {
+    if(d.t === 'PING') return conn.send({t: 'PONG'});
+    if(d.t === 'PONG') return; // 简化处理
+
     if(d.t === 'HELLO') {
-      state.knownPeers.set(conn.peer, {n: d.n, ts: Date.now()});
+      conn.label = d.n;
+      state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
+      localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
       if(window.ui) window.ui.renderList();
     }
-    if(d.t === 'PEX') {
-      d.peers.forEach(p => { 
-        if(p.id!==state.myId && !state.knownPeers.has(p.id)) state.knownPeers.set(p.id, {n: p.n, ts: Date.now()}); 
+    
+    if(d.t === 'PEER_EX') {
+      d.list.forEach(id => {
+        if(id !== state.myId && !state.conns[id]) this.connectTo(id);
       });
-      if(window.ui) window.ui.renderList();
     }
     
     if(d.t === 'MSG') {
@@ -209,17 +195,13 @@ const core = {
       state.seenMsgs.add(d.id);
       state.latestTs = Math.max(state.latestTs, d.ts);
       
-      // 更新发信人信息
-      state.knownPeers.set(d.senderId, {n: d.n, ts: Date.now()});
-      
+      // v3 增强：存库 + UI逻辑
       await db.saveMsg(d);
       
-      // 只有当消息是发给“全员”或者“我”时，才处理 UI
       const isPublic = d.target === 'all';
       const isToMe = d.target === state.myId;
       
       if (isPublic || isToMe) {
-        // 如果当前正好在看这个频道，上屏；否则加红点
         const chatKey = isPublic ? 'all' : d.senderId;
         if (state.activeChat === chatKey) {
           if(window.ui) window.ui.appendMsg(d);
@@ -229,135 +211,125 @@ const core = {
         }
       }
       
-      // 转发 (Gossip): 无论是不是发给我的，只要 TTL > 0 都要转发（这就是“网络层”）
-      if(d.ttl > 0) { d.ttl--; this.broadcast(d, conn.peer); }
-    }
-
-    if(d.t === 'SYNC_REQ') {
-      const msgs = await db.getAfter(CONST.SYNC_LIMIT, d.afterTs);
-      if(msgs.length > 0) conn.send({ t: 'SYNC_RES', msgs: msgs });
-    }
-    
-    if(d.t === 'SYNC_RES') {
-      d.msgs.forEach(async m => {
-        if(!state.seenMsgs.has(m.id)) {
-          state.seenMsgs.add(m.id);
-          state.latestTs = Math.max(state.latestTs, m.ts);
-          await db.saveMsg(m);
-          // 同步回来的消息也要判断归属
-          const chatKey = m.target === 'all' ? 'all' : (m.target === state.myId ? m.senderId : null);
-          if (chatKey && state.activeChat === chatKey && window.ui) window.ui.appendMsg(m);
-        }
-      });
+      // v2 转发逻辑：如果是群聊，扩散给除来源外的所有人
+      if(d.target === 'all') this.flood(d, conn.peer);
     }
   },
 
-  broadcast(pkt, excludeId) {
-    for(const [pid, conn] of state.activeConns) {
-      if(pid !== excludeId && conn.open) conn.send(pkt);
-    }
+  flood(pkt, exclude) {
+    Object.values(state.conns).forEach(c => {
+      if(c.peer !== exclude && c.open) c.send(pkt);
+    });
   },
 
   async sendMsg(txt) {
     const pkt = {
       t: 'MSG', id: util.uuid(), n: state.myName, senderId: state.myId,
       target: state.activeChat, // 'all' or PeerID
-      txt: txt, ts: Date.now(), ttl: CONST.TTL
+      txt: txt, ts: Date.now()
     };
     
     state.seenMsgs.add(pkt.id);
     state.latestTs = Math.max(state.latestTs, pkt.ts);
     
+    // 先存库，再进队列，再展示
     await db.saveMsg(pkt);
     await db.addPending(pkt);
     if(window.ui) window.ui.appendMsg(pkt);
+    
     this.retryPending();
   },
   
   async retryPending() {
-    if(state.activeConns.size === 0) return;
     const list = await db.getPending();
+    if(list.length === 0) return;
+    
+    // 只要连上任何一个人（且不是房间ID本身），就开始尝试发送
+    const ready = Object.keys(state.conns).some(id => !id.includes('p1-room'));
+    if(!ready) return;
+
     list.forEach(async pkt => {
-      this.broadcast(pkt, null);
+      if(pkt.target === 'all') {
+        this.flood(pkt, null);
+      } else {
+        // 私聊：尝试直连发送
+        const conn = state.conns[pkt.target];
+        if(conn && conn.open) conn.send(pkt);
+        else {
+          // 如果没连上目标，先尝试连一下，暂不删队列
+          this.connectTo(pkt.target); 
+          return; 
+        }
+      }
+      // 发送成功（或已广播），移出队列
       await db.removePending(pkt.id); 
     });
   },
 
-  sendSyncReq(targetPeer, afterTs) {
-    const conn = state.activeConns.get(targetPeer);
-    if(conn && conn.open) conn.send({ t: 'SYNC_REQ', afterTs: afterTs });
+  sendPing() {
+    Object.values(state.conns).forEach(c => { if(c.open) c.send({t: 'PING'}); });
   },
 
-  maintainMesh() {
-    for(const [pid, conn] of state.activeConns) if(!conn.open) state.activeConns.delete(pid);
-    
-    // 补人
-    if(state.activeConns.size < CONST.MIN_PEERS && state.knownPeers.size > 0) {
-      const pool = Array.from(state.knownPeers.keys()).filter(id => !state.activeConns.has(id) && id !== state.myId);
-      if(pool.length) this.connect(pool[Math.floor(Math.random()*pool.length)]);
-      else this.connectToSeeds();
-    }
-    // 裁人
-    if(state.activeConns.size > CONST.MAX_PEERS + 2 && !state.isSeed) {
-      const peers = Array.from(state.activeConns.keys());
-      const victim = peers[Math.floor(Math.random()*peers.length)];
-      state.activeConns.get(victim).close();
-      state.activeConns.delete(victim);
-    }
+  cleanup() {
+    Object.keys(state.conns).forEach(pid => { if(!state.conns[pid].open) delete state.conns[pid]; });
+  },
+  
+  exchange() {
+    const list = Object.values(state.contacts).map(c => c.id).filter(id => id);
+    const onlines = Object.keys(state.conns);
+    const fullList = [...new Set([...list, ...onlines])];
+    const pkt = {t: 'PEER_EX', list: fullList};
+    Object.values(state.conns).forEach(c => { if(c.open) c.send(pkt); });
   },
 
-  gossipPex() {
-    const list = [];
-    state.knownPeers.forEach((v, k) => list.push({id: k, n: v.n}));
-    const sample = list.sort(()=>Math.random()-0.5).slice(0, 20);
-    this.broadcast({ t: 'PEX', peers: sample }, null);
+  async loadHistory(limit) {
+    if(state.loading) return;
+    state.loading = true;
+    const msgs = await db.getRecent(limit, state.activeChat, state.oldestTs);
+    if(msgs.length > 0) {
+      state.oldestTs = msgs[0].ts;
+      msgs.forEach(m => {
+        state.seenMsgs.add(m.id);
+        if(window.ui) window.ui.appendMsg(m);
+      });
+    }
+    state.loading = false;
   }
 };
 
-// --- UI 逻辑 (完全回滚到原版风格) ---
+// --- 5. UI (保持最新版汉化界面) ---
 const ui = {
   init() {
     const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
-    
     bind('btnSend', () => {
       const el = document.getElementById('editor');
       if(el.innerText.trim()) { core.sendMsg(el.innerText.trim()); el.innerText=''; }
     });
-    
     const editor = document.getElementById('editor');
     if(editor) editor.addEventListener('paste', e => {
         e.preventDefault();
         document.execCommand('insertText', false, (e.clipboardData||window.clipboardData).getData('text/plain'));
     });
-    
-    bind('btnToggleLog', () => { 
-      const el = document.getElementById('miniLog'); 
-      el.style.display = el.style.display === 'flex' ? 'none' : 'flex'; 
-    });
-    
-    bind('btnSettings', () => {
-       document.getElementById('settings-panel').style.display = 'grid';
-       document.getElementById('iptNick').value = state.myName;
-    });
+    bind('btnToggleLog', () => { const el = document.getElementById('miniLog'); el.style.display = el.style.display === 'flex'?'none':'flex'; });
+    bind('btnSettings', () => { document.getElementById('settings-panel').style.display = 'grid'; document.getElementById('iptNick').value = state.myName; });
     bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
     bind('btnSave', () => {
        const n = document.getElementById('iptNick').value.trim();
        if(n) { state.myName = n; localStorage.setItem('nickname', n); ui.updateSelf(); }
        document.getElementById('settings-panel').style.display = 'none';
     });
-
     bind('btnFile', () => document.getElementById('fileInput').click());
     document.getElementById('fileInput').onchange = function(e) {
       const f = e.target.files[0];
-      if(!f || f.size > 500*1024) return alert('文件需<500KB');
+      if(!f || f.size > 5*1024*1024) return alert('文件需<5MB');
       const r = new FileReader();
       r.onload = (ev) => core.sendMsg(`[file=${f.name}]${ev.target.result}[/file]`);
-      r.readAsDataURL(f);
-      this.value = '';
+      r.readAsDataURL(f); this.value = '';
     };
-    
-    // 手机端侧边栏开关
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
+    
+    const box = document.getElementById('msgList');
+    box.addEventListener('scroll', () => { if(box.scrollTop === 0) core.loadHistory(20); });
 
     this.updateSelf();
     this.renderList();
@@ -366,71 +338,61 @@ const ui = {
   updateSelf() {
     document.getElementById('myId').innerText = state.myId.slice(0,6);
     document.getElementById('myNick').innerText = state.myName;
-    document.getElementById('statusText').innerText = state.isSeed ? '基站' : '在线';
+    document.getElementById('statusText').innerText = '在线';
     document.getElementById('statusDot').className = 'dot online';
   },
-  
-  // 核心：恢复 switchChat 逻辑
+
   switchChat(target, name) {
     state.activeChat = target;
     state.activeChatName = name;
     state.unread[target] = 0;
+    state.oldestTs = Date.now(); // 重置分页游标
     
     document.getElementById('chatTitle').innerText = name;
     document.getElementById('chatStatus').innerText = target === 'all' ? '全员' : '私聊';
-    
-    // 移动端收起侧边栏
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
     
-    // 重新加载该会话的历史记录
-    core.refreshHistory();
+    window.ui.clearMsgs();
+    core.loadHistory(50); // 重新加载该会话历史
     this.renderList();
   },
 
-  // 核心：恢复原版列表渲染
   renderList() {
     const list = document.getElementById('contactList');
-    document.getElementById('onlineCount').innerText = state.activeConns.size; // 显示直连数
+    document.getElementById('onlineCount').innerText = Object.keys(state.conns).length;
     
-    // 公共频道项
     const pubUnread = state.unread['all'] || 0;
     let html = `
       <div class="contact-item ${state.activeChat==='all'?'active':''}" onclick="ui.switchChat('all', '公共频道')">
         <div class="avatar" style="background:#2a7cff">群</div>
-        <div class="c-info">
-          <div class="c-name">
-            公共频道
-            ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}
-          </div>
-        </div>
+        <div class="c-info"><div class="c-name">公共频道 ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}</div></div>
       </div>
     `;
     
-    // 用户列表项 (从 knownPeers 渲染)
-    state.knownPeers.forEach((v, id) => {
-      if (id === state.myId) return;
+    // 合并 contacts 和 activeConns
+    const map = new Map();
+    Object.keys(state.contacts).forEach(k => map.set(state.contacts[k].id, state.contacts[k]));
+    Object.keys(state.conns).forEach(k => { if(!map.has(k)) map.set(k, {id:k, n:state.conns[k].label}); });
+    
+    map.forEach((v, id) => {
+      if(id === state.myId || id.includes('p1-room')) return;
       const unread = state.unread[id] || 0;
-      const isOnline = state.activeConns.has(id); // 直连的才算“在线”显示绿色，否则灰色
+      const isOnline = !!state.conns[id];
+      const name = util.escape(v.n || '未知');
       
       html += `
-        <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${util.escape(v.n)}')">
-          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${v.n[0]}</div>
+        <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">
+          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${name[0]}</div>
           <div class="c-info">
-            <div class="c-name">
-              ${util.escape(v.n)} 
-              ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}
-            </div>
-            <div class="c-time">${isOnline?'直连':'离线'}</div>
+            <div class="c-name">${name} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
+            <div class="c-time">${isOnline?'在线':'离线'}</div>
           </div>
         </div>`;
     });
-    
     list.innerHTML = html;
   },
   
-  clearMsgs() {
-    document.getElementById('msgList').innerHTML = '';
-  },
+  clearMsgs() { document.getElementById('msgList').innerHTML = ''; },
 
   appendMsg(m) {
     const box = document.getElementById('msgList');
@@ -452,16 +414,14 @@ const ui = {
         </div>
       </div>`;
 
+    // 排序插入
     const children = Array.from(box.children);
     let inserted = false;
     for (let i = children.length - 1; i >= 0; i--) {
-      const el = children[i];
-      const ts = parseInt(el.getAttribute('data-ts') || '0');
-      if (m.ts >= ts) {
+      if (m.ts >= parseInt(children[i].getAttribute('data-ts'))) {
         if (i === children.length - 1) box.insertAdjacentHTML('beforeend', html);
         else children[i+1].insertAdjacentHTML('beforebegin', html);
-        inserted = true;
-        break;
+        inserted = true; break;
       }
     }
     if (!inserted) {
