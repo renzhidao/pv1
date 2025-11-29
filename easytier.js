@@ -8,20 +8,23 @@ const CONFIG = {
   debug: 0
 };
 
+// 动态房间号：每10分钟换一个
 const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 600000);
 
 const app = {
-  myId: '',
+  // 修复1：固定 ID，刷新不变
+  myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
+  
   peer: null,
   conns: {}, 
   contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{"all":[]}'),
-  // 需求：红点数据存储
   unread: JSON.parse(localStorage.getItem('p1_unread') || '{}'),
   seen: new Set(),
   
   isHub: false,
+  roomId: getRoomId(),
 
   log(s) {
     const el = document.getElementById('miniLog');
@@ -29,51 +32,73 @@ const app = {
   },
 
   init() {
+    localStorage.setItem('p1_my_id', this.myId);
     this.start();
+    
+    // 修复2：增强心跳，死命重连
     setInterval(() => {
       this.cleanup();
+      this.roomId = getRoomId(); // 更新房间号
+      
+      // 1. 如果我不是 Hub，且没连上 Hub，必须连 Hub
+      if (!this.isHub) {
+        const hubConn = this.conns[this.roomId];
+        if (!hubConn || !hubConn.open) {
+          this.connectTo(this.roomId);
+        }
+      }
+      
+      // 2. 自动重连通讯录里的老友
+      Object.values(this.contacts).forEach(c => {
+        if(c.id && c.id !== this.myId && (!this.conns[c.id] || !this.conns[c.id].open)) {
+           this.connectTo(c.id);
+        }
+      });
+
       this.exchange();
-      if(Object.keys(this.conns).length === 0 && !this.isHub) this.start();
     }, 5000);
+
     document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState === 'visible' && (!this.peer || this.peer.disconnected)) this.start();
+      if(document.visibilityState === 'visible') this.start();
     });
   },
 
   start() {
-    if(this.peer && !this.peer.destroyed) return;
-    const roomId = getRoomId();
-    this.initPeer(undefined, roomId);
+    if(this.peer && !this.peer.destroyed && !this.peer.disconnected) return;
+    this.initPeer(this.myId);
   },
 
-  initPeer(id, roomId) {
+  initPeer(id) {
     try {
       const p = new Peer(id, CONFIG);
+      
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
-        this.isHub = (myId === roomId);
-        ui.updateSelf();
         this.log(`✅ 上线: ${this.myName}`);
-        if (!this.isHub) {
-          this.connectTo(roomId);
-          Object.values(this.contacts).forEach(c => { if(c.id) this.connectTo(c.id); });
-        } else {
-          this.log('👑 我是本时段的值班员');
-        }
+        ui.updateSelf();
+        
+        // 启动即尝试连房
+        this.connectTo(this.roomId);
       });
 
       p.on('error', err => {
-        if (err.type === 'peer-unavailable' && err.message.includes(roomId)) {
-           this.log('🚨 房间空闲，正在上位...');
-           this.peer.destroy();
-           this.peer = null;
-           setTimeout(() => this.initPeer(roomId, null), 500);
+        // 修复3：如果房间号没人用，我来当房主
+        if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
+           if(!this.isHub) {
+             this.log('🚨 房间空闲，正在上位...');
+             this.isHub = true;
+             // 销毁旧连接，用 RoomID 重生
+             this.peer.destroy();
+             setTimeout(() => this.initPeer(this.roomId), 500);
+           }
         }
         else if (err.type === 'unavailable-id') {
-           if(id === roomId) {
+           // 如果我想当房主但被占了，回退到普通 ID
+           if(id === this.roomId) {
              this.log('👑 席位已满，转普通节点');
-             this.initPeer(undefined, roomId);
+             this.isHub = false;
+             this.initPeer(this.myId); 
            }
         }
       });
@@ -83,33 +108,36 @@ const app = {
   },
 
   connectTo(id) {
-    if(id === this.myId || this.conns[id]) return;
-    const conn = this.peer.connect(id, {reliable: true});
-    this.setupConn(conn);
+    if(!this.peer || this.peer.destroyed || id === this.myId || (this.conns[id] && this.conns[id].open)) return;
+    try {
+      const conn = this.peer.connect(id, {reliable: true});
+      this.setupConn(conn);
+    } catch(e){}
   },
 
   setupConn(conn) {
-    const pid = conn.peer;
     conn.on('open', () => {
-      this.conns[pid] = conn;
+      this.conns[conn.peer] = conn;
       ui.renderList();
-      conn.send({t: 'HELLO', n: this.myName});
-      const list = Object.values(this.contacts).map(c => c.id).filter(id => id);
-      conn.send({t: 'PEER_EX', list});
+      // 握手
+      conn.send({t: 'HELLO', n: this.myName, id: this.myId});
+      // 立即交换通讯录
+      this.exchange();
     });
 
     conn.on('data', d => {
       if(d.t === 'HELLO') {
         conn.label = d.n;
-        this.contacts[d.n] = {id: pid, t: Date.now()};
+        // 更新通讯录，确保 ID 对应
+        this.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(this.contacts));
         ui.renderList();
-        if(ui.activeChatName === d.n) ui.switchChat(d.n, pid);
+        if(ui.activeChatName === d.n) ui.switchChat(d.n, conn.peer);
       }
       
       if(d.t === 'PEER_EX') {
         d.list.forEach(id => {
-          if(id !== this.myId && !this.conns[id] && Object.keys(this.conns).length < 8) this.connectTo(id);
+          if(id !== this.myId && !this.conns[id]) this.connectTo(id);
         });
       }
       
@@ -120,24 +148,22 @@ const app = {
         const key = d.target === 'all' ? 'all' : d.senderName;
         if(d.target === 'all' || d.target === this.myName) {
           this.saveMsg(key, d.txt, false, d.senderName);
-          
-          // 需求：红点逻辑
           if(d.target !== 'all' && ui.activeChatName !== d.senderName) {
             this.addUnread(d.senderName);
           }
         }
-        if(d.target === 'all') this.flood(d, pid);
+        if(d.target === 'all') this.flood(d, conn.peer);
       }
     });
 
-    conn.on('close', () => { delete this.conns[pid]; ui.renderList(); });
-    conn.on('error', () => { delete this.conns[pid]; ui.renderList(); });
+    conn.on('close', () => { delete this.conns[conn.peer]; ui.renderList(); });
+    conn.on('error', () => { delete this.conns[conn.peer]; ui.renderList(); });
   },
 
   flood(pkt, exclude) {
-    Object.keys(this.conns).forEach(pid => {
-      if(pid !== exclude && this.conns[pid].open) {
-        try { this.conns[pid].send(pkt); } catch(e){}
+    Object.values(this.conns).forEach(c => {
+      if(c.peer !== exclude && c.open) {
+        try { c.send(pkt); } catch(e){}
       }
     });
   },
@@ -154,10 +180,10 @@ const app = {
       this.flood(pkt, null);
     } else {
       const cid = this.contacts[targetName]?.id;
-      if(this.conns[cid]) this.conns[cid].send(pkt);
+      if(this.conns[cid] && this.conns[cid].open) this.conns[cid].send(pkt);
       else {
         if(cid) this.connectTo(cid);
-        setTimeout(() => { if(this.conns[cid]) this.conns[cid].send(pkt); }, 2000);
+        // 存入待发送队列或重试逻辑省略，保持最简，依赖自动重连
       }
     }
   },
@@ -171,7 +197,6 @@ const app = {
     if(ui.activeChatName === key || (key==='all' && ui.activeChatName==='公共频道')) ui.appendMsg(m);
   },
   
-  // 需求：红点管理
   addUnread(name) {
     this.unread[name] = (this.unread[name] || 0) + 1;
     localStorage.setItem('p1_unread', JSON.stringify(this.unread));
@@ -191,7 +216,10 @@ const app = {
   
   exchange() {
     const list = Object.values(this.contacts).map(c => c.id).filter(id => id);
-    const pkt = {t: 'PEER_EX', list};
+    // 也把我知道的在线人推出去
+    const onlines = Object.keys(this.conns);
+    const fullList = [...new Set([...list, ...onlines])];
+    const pkt = {t: 'PEER_EX', list: fullList};
     Object.values(this.conns).forEach(c => { if(c.open) c.send(pkt); });
   }
 };
@@ -211,7 +239,6 @@ const ui = {
     
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
     
-    // 设置
     bind('btnSettings', () => {
        document.getElementById('settings-panel').style.display = 'grid';
        document.getElementById('iptNick').value = app.myName;
@@ -225,34 +252,28 @@ const ui = {
        document.getElementById('settings-panel').style.display = 'none';
     });
     
-    // 需求：附件功能
     bind('btnFile', () => { document.getElementById('fileInput').click(); });
     document.getElementById('fileInput').onchange = function(e) {
       const f = e.target.files[0];
       if(!f) return;
-      
-      // 简单大小限制，避免Base64卡顿
       if(f.size > 5 * 1024 * 1024) { alert('文件过大，请发送 5MB 以内的文件'); this.value=''; return; }
-      
       const r = new FileReader();
       r.onload = function(ev) {
         const data = ev.target.result;
         let msg = '';
         if(f.type.startsWith('image/')) msg = `[img]${data}[/img]`;
         else msg = `[file=${f.name}]${data}[/file]`;
-        
         app.send(msg, ui.activeChatName);
       };
       r.readAsDataURL(f);
       this.value = '';
     };
 
-    // PWA
     window.addEventListener('beforeinstallprompt', e => {
       e.preventDefault();
       const btn = document.createElement('div');
       btn.className = 'btn-icon';
-      btn.innerText = '';
+      btn.innerText = '📲';
       btn.onclick = () => { e.prompt(); btn.remove(); };
       document.querySelector('.chat-header').appendChild(btn);
     });
@@ -271,10 +292,7 @@ const ui = {
   switchChat(name, id) {
     this.activeChatName = name;
     this.activeChatId = id;
-    
-    // 需求：清除红点
     app.clearUnread(name);
-    
     if(id && !app.conns[id]) app.connectTo(id);
     
     document.getElementById('chatTitle').innerText = name;
@@ -311,7 +329,6 @@ const ui = {
       const isOnline = !!onlineC;
       const unread = app.unread[name] || 0;
       
-      // 需求：显示红点数字
       html += `
         <div class="contact-item ${this.activeChatName===name?'active':''}" onclick="ui.switchChat('${name}', '${id}')">
           <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${name[0]}</div>
@@ -329,12 +346,8 @@ const ui = {
 
   appendMsg(m) {
     const box = document.getElementById('msgList');
-    
-    // 需求：解析图片和文件
     let content = m.txt;
-    // 简单XSS防护+解析
     content = content.replace(/</g, '<').replace(/>/g, '>');
-    // 还原解析逻辑
     content = content.replace(/\[img\](.*?)\[\/img\]/g, '<img src="$1" class="chat-img" onclick="window.open(this.src)">');
     content = content.replace(/\[file=(.*?)\](.*?)\[\/file\]/g, '<a href="$2" download="$1" style="color:var(--text);text-decoration:underline;display:block;margin-top:5px">📄 $1</a>');
     
