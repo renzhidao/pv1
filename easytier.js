@@ -92,7 +92,7 @@ const logSystem = {
 const util = {
   log: (s) => logSystem.add(s),
   uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  escape: (s) => (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
+  escape: (s) => (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
 };
 
 const core = {
@@ -136,7 +136,7 @@ const core = {
         state.myId = id; state.peer = p;
         util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
-        setTimeout(() => this.connectTo(state.roomId), 500);
+        setTimeout(() => { if(state.roomId) this.connectTo(state.roomId); }, 500);
       });
       p.on('error', err => {
         util.log(`PeerErr: ${err.type}`);
@@ -229,11 +229,25 @@ const core = {
       
       db.saveMsg(d);
       
+      // 房主作为路由节点：转发或缓存私聊消息
+      if (state.isHub && !isPublic && !isToMe) {
+        if (state.conns[d.target] && state.conns[d.target].open) {
+          state.conns[d.target].send(d);
+        } else {
+          db.addPending(d);
+          this.connectTo(d.target);
+        }
+      }
+      
       if(d.target === 'all') this.flood(d, conn.peer);
     }
   },
 
   flood(pkt, exclude) {
+    if (typeof pkt.ttl === 'number') {
+      if (pkt.ttl <= 0) return;
+      pkt = Object.assign({}, pkt, { ttl: pkt.ttl - 1 });
+    }
     Object.values(state.conns).forEach(c => { if(c.peer !== exclude && c.open) c.send(pkt); });
   },
 
@@ -321,6 +335,17 @@ const ui = {
     bind('btnSave', () => {
        const n = document.getElementById('iptNick').value.trim();
        if(n) { state.myName = n; localStorage.setItem('nickname', n); ui.updateSelf(); }
+       const peerInput = document.getElementById('iptPeer');
+       if (peerInput) {
+         const pid = peerInput.value.trim();
+         if (pid && pid !== state.myId) {
+           state.contacts[pid] = { id: pid, n: pid, t: Date.now() };
+           localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
+           core.connectTo(pid);
+           ui.renderList();
+         }
+         peerInput.value = '';
+       }
        document.getElementById('settings-panel').style.display = 'none';
     });
     bind('btnFile', () => document.getElementById('fileInput').click());
@@ -332,8 +357,33 @@ const ui = {
       r.readAsDataURL(f); this.value = '';
     };
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
+    bind('btnDlLog', () => {
+      const el = document.getElementById('logContent');
+      if (!el) return;
+      const lines = Array.from(el.children).map(n => n.innerText || '').join('\n');
+      const blob = new Blob([lines], {type:'text/plain;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'p1-log-' + new Date().toISOString().replace(/[:.]/g,'-') + '.txt';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
     const box = document.getElementById('msgList');
     box.addEventListener('scroll', () => { if(box.scrollTop === 0) core.loadHistory(20); });
+
+    const contactListEl = document.getElementById('contactList');
+    if (contactListEl) {
+      contactListEl.addEventListener('click', (e) => {
+        const item = e.target.closest('.contact-item');
+        if (!item) return;
+        const chatId = item.getAttribute('data-chat-id');
+        const chatName = item.getAttribute('data-chat-name') || '';
+        if (chatId) ui.switchChat(chatId, chatName);
+      });
+    }
 
     this.updateSelf();
     this.renderList();
@@ -342,7 +392,7 @@ const ui = {
   updateSelf() {
     document.getElementById('myId').innerText = state.myId.slice(0,6);
     document.getElementById('myNick').innerText = state.myName;
-    document.getElementById('statusText').innerText = state.isSeed ? '👑 房主' : '在线';
+    document.getElementById('statusText').innerText = state.isHub ? '👑 房主' : '在线';
     document.getElementById('statusDot').className = 'dot online';
   },
 
@@ -366,7 +416,7 @@ const ui = {
     
     const pubUnread = state.unread['all'] || 0;
     let html = `
-      <div class="contact-item ${state.activeChat==='all'?'active':''}" onclick="ui.switchChat('all', '公共频道')">
+      <div class="contact-item ${state.activeChat==='all'?'active':''}" data-chat-id="all" data-chat-name="公共频道">
         <div class="avatar" style="background:#2a7cff">群</div>
         <div class="c-info"><div class="c-name">公共频道 ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}</div></div>
       </div>
@@ -386,14 +436,16 @@ const ui = {
       if (isSeed && !isOnline) return; 
 
       const unread = state.unread[id] || 0;
-      let name = util.escape(v.n || '未知');
-      if(isSeed) name = '👑 房主';
+      const rawName = v.n || '未知';
+      const displayName = isSeed ? '👑 房主' : rawName;
+      const safeDisplayName = util.escape(displayName);
+      const safeId = util.escape(id);
       
       html += `
-        <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">
-          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${name[0]}</div>
+        <div class="contact-item ${state.activeChat===id?'active':''}" data-chat-id="${safeId}" data-chat-name="${safeDisplayName}">
+          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${safeDisplayName[0]}</div>
           <div class="c-info">
-            <div class="c-name">${name} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
+            <div class="c-name">${safeDisplayName} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
             <div class="c-time">${isOnline?'在线':'离线'}</div>
           </div>
         </div>`;
