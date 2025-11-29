@@ -34,7 +34,9 @@ const db = {
     if(!this._db) return [];
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readonly');
-      const req = tx.objectStore('msgs').index('ts').openCursor(IDBKeyRange.upperBound(beforeTs, true), 'prev');
+      // 核心修复：允许加载未来时间的消息（beforeTs=Infinity），防止对方时钟快导致消息不显示
+      const range = beforeTs === Infinity ? null : IDBKeyRange.upperBound(beforeTs, true);
+      const req = tx.objectStore('msgs').index('ts').openCursor(range, 'prev');
       const res = [];
       req.onsuccess = e => {
         const cursor = e.target.result;
@@ -65,7 +67,7 @@ const state = {
   peer: null, conns: {}, contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   isHub: false, roomId: '', 
   activeChat: 'all', activeChatName: '公共频道', unread: JSON.parse(localStorage.getItem('p1_unread') || '{}'),
-  seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
+  seenMsgs: new Set(), latestTs: 0, oldestTs: Infinity, loading: false
 };
 
 const logSystem = {
@@ -92,7 +94,25 @@ const logSystem = {
 const util = {
   log: (s) => logSystem.add(s),
   uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  escape: (s) => (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
+  // 修复：正确 HTML 转义，避免 XSS
+  escape(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  },
+  colorHash(str) {
+    let hash = 0;
+    str = String(str || '');
+    for (let i = 0; i < str.length; i++) {
+      hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
+    return '#' + '000000'.substring(0, 6 - c.length) + c;
+  }
 };
 
 const core = {
@@ -208,6 +228,11 @@ const core = {
     if(d.t === 'MSG') {
       if(state.seenMsgs.has(d.id)) return;
       state.seenMsgs.add(d.id);
+
+      // 核心修复：强制消息时间戳前移，避免因对方时间滞后导致消息沉底
+      d.ts = Math.max(d.ts, state.latestTs + 1);
+      state.latestTs = d.ts;
+
       if(d.n) {
         state.contacts[d.senderId] = {id: d.senderId, n: d.n, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
@@ -223,13 +248,14 @@ const core = {
         } else {
           state.unread[chatKey] = (state.unread[chatKey]||0) + 1;
           localStorage.setItem('p1_unread', JSON.stringify(state.unread));
+          if(window.navigator.vibrate) window.navigator.vibrate(200);
           if(window.ui) window.ui.renderList(); 
         }
       }
       
       db.saveMsg(d);
       
-      // 房主作为路由节点：转发或缓存私聊消息
+      // 核心修复：房主转发私聊逻辑
       if (state.isHub && !isPublic && !isToMe) {
         if (state.conns[d.target] && state.conns[d.target].open) {
           state.conns[d.target].send(d);
@@ -400,7 +426,10 @@ const ui = {
     state.activeChat = name; state.activeChatName = id;
     state.unread[name] = 0;
     localStorage.setItem('p1_unread', JSON.stringify(state.unread));
-    state.oldestTs = Date.now();
+    
+    // 核心修复：重置为 Infinity，确保能拉取到未来时间的消息
+    state.oldestTs = Infinity;
+    
     document.getElementById('chatTitle').innerText = id;
     document.getElementById('chatStatus').innerText = name === 'all' ? '全员' : '私聊';
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
@@ -441,9 +470,12 @@ const ui = {
       const safeDisplayName = util.escape(displayName);
       const safeId = util.escape(id);
       
+      // 核心修复：头像背景色算法，区分不同人
+      const avatarBg = isOnline ? '#22c55e' : (isSeed ? '#f59e0b' : util.colorHash(id));
+
       html += `
         <div class="contact-item ${state.activeChat===id?'active':''}" data-chat-id="${safeId}" data-chat-name="${safeDisplayName}">
-          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${safeDisplayName[0]}</div>
+          <div class="avatar" style="background:${avatarBg}">${safeDisplayName[0]}</div>
           <div class="c-info">
             <div class="c-name">${safeDisplayName} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
             <div class="c-time">${isOnline?'在线':'离线'}</div>
@@ -467,8 +499,14 @@ const ui = {
     const timeStr = new Date(m.ts).toLocaleTimeString();
     const name = isMe ? '我' : util.escape(m.n);
     
+    // 核心修复：消息气泡旁显示小头像（他人），增加视觉交错感
+    const avatarBg = isMe ? 'transparent' : util.colorHash(m.senderId);
+    const avatarStyle = isMe ? '' : `style="background:${avatarBg};width:24px;height:24px;font-size:12px;margin-right:4px"`;
+    const avatarHtml = isMe ? '' : `<div class="avatar" ${avatarStyle}>${name[0]}</div>`;
+
     const html = `
       <div class="msg-row ${isMe?'me':'other'}" id="msg-${m.id}" data-ts="${m.ts}">
+        ${avatarHtml}
         <div>
           <div class="msg-bubble">${content}</div>
           <div class="msg-meta">${name} ${timeStr}</div>
