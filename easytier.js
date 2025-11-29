@@ -102,7 +102,7 @@ const app = {
         this.log(`❌ PeerError: ${err.type}`);
         if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
            if(!this.isHub) {
-             this.log('👑 房间无人，晋升为 Hub');
+             this.log(' 房间无人，晋升为 Hub');
              this.isHub = true;
              this.peer.destroy();
              setTimeout(() => this.initPeer(this.roomId), 500);
@@ -271,22 +271,11 @@ const ui = {
     
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
     
-    // 日志开关 & 点击复制
+    // 日志开关 - 纯净版，无点击劫持
     bind('btnToggleLog', () => {
       const el = document.getElementById('miniLog');
       el.style.display = el.style.display === 'block' ? 'none' : 'block';
-      
-      // 核心修改：点击日志自动复制
-      el.onclick = () => {
-        navigator.clipboard.writeText(el.innerText).then(() => {
-          // 临时提示
-          const old = el.style.background;
-          el.style.background = '#22c55e';
-          setTimeout(() => el.style.background = old, 200);
-          alert('✅ 日志已复制到剪贴板');
-        }).catch(err => alert('复制失败，请长按手动复制'));
-      };
-      app.log('📟 日志窗口已开启 (点击即可复制)');
+      app.log(' 日志窗口已开启');
     });
     
     bind('btnSettings', () => {

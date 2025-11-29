@@ -95,7 +95,18 @@
     .st-input { width: 100%; padding: 10px; background: #0a0c10; border: 1px solid #2b3040; border-radius: 8px; color: #fff; font-size: 16px; margin-bottom: 15px; }
     .st-btn { width: 100%; padding: 12px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; background: #2a7cff; color: #fff; }
     
-    .mini-log { position: absolute; top: 60px; right: 10px; width: 200px; height: 120px; background: rgba(0,0,0,0.8); color: #0f0; font-size: 10px; padding: 8px; border-radius: 8px; overflow: auto; pointer-events: none; opacity: 0.5; z-index: 10; display: none; }
+    /* 日志窗口修复：允许文字选中 + 样式美化 */
+    .mini-log { 
+      position: absolute; top: 60px; right: 10px; width: 200px; height: 200px; 
+      background: rgba(0,0,0,0.9); color: #0f0; font-family: monospace; font-size: 10px; 
+      padding: 10px; border-radius: 8px; border: 1px solid #333;
+      overflow: auto; 
+      pointer-events: auto; /* 关键：允许交互 */
+      user-select: text;    /* 关键：允许选中 */
+      -webkit-user-select: text; 
+      z-index: 99; display: none; 
+      white-space: pre-wrap; /* 保留换行 */
+    }
   </style>
 </head>
 <body>
