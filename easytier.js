@@ -72,7 +72,7 @@ const state = {
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
   peer: null,
-  conns: {}, // 连接池
+  conns: {}, 
   contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   isHub: false,
   roomId: '', 
@@ -135,7 +135,7 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v8.1 修复版)`);
+    util.log(`🚀 启动 (v8.2 修复版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
@@ -183,7 +183,6 @@ const core = {
   setupConn(conn) {
     conn.on('open', () => {
       state.conns[conn.peer] = conn;
-      // 发送 HELLO 并带上自己的名字
       conn.send({t: 'HELLO', n: state.myName, id: state.myId});
       this.exchange(); 
       this.retryPending();
@@ -199,13 +198,13 @@ const core = {
     if(d.t === 'PONG') return; 
 
     if(d.t === 'HELLO') {
-      // 修复核心：收到 HELLO 后，立即更新 conn 上的标签，并存入 contacts
       conn.label = d.n;
-      state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()}; // 关键修复：用 d.id 而不是 conn.peer (如果是房主，conn.peer 是房间号)
+      state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
       
-      // 如果发来的是房主 ID，特殊标记一下
+      // 修复：如果是房主，强制改名为“房主”
       if(d.id === state.roomId) {
-        state.contacts['房主'] = {id: state.roomId, t: Date.now()};
+        state.contacts['房主'] = {id: state.roomId, t: Date.now(), n: '房主'};
+        conn.label = '房主';
       }
       
       localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
@@ -252,7 +251,7 @@ const core = {
     const pkt = {
       t: 'MSG', id: util.uuid(), n: state.myName, senderId: state.myId,
       target: state.activeChat, 
-      txt: txt, ts: Date.now()
+      txt: txt, ts: Date.now(), ttl: CONST.TTL
     };
     
     state.seenMsgs.add(pkt.id);
@@ -380,17 +379,21 @@ const ui = {
     const map = new Map();
     Object.keys(state.contacts).forEach(k => map.set(state.contacts[k].id, state.contacts[k]));
     Object.keys(state.conns).forEach(k => { 
-      // 修复：如果 conn.label 为空，尝试从 contacts 找名字，否则显示 '未知'
       let name = state.conns[k].label;
-      if(!name && state.contacts[k]) name = state.contacts[k].n; // 名字修正
+      if(!name && state.contacts[k]) name = state.contacts[k].n; 
       if(!map.has(k)) map.set(k, {id:k, n: name || '未知'}); 
     });
     
     map.forEach((v, id) => {
-      if(id === state.myId || id.includes('p1-room')) return;
+      if(id === state.myId) return; // 不显示自己
+      // 修复核心：不再过滤 p1-room-xxx，让房主显示出来
+      
       const unread = state.unread[id] || 0;
       const isOnline = !!state.conns[id];
-      const name = util.escape(v.n || '未知'); // 名字修正
+      let name = util.escape(v.n || '未知');
+      
+      // UI 美化：给房主加皇冠
+      if(id.includes('p1-room')) name = '👑 房主';
       
       html += `
         <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">
