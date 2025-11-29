@@ -432,7 +432,6 @@ const ui = {
 window.app = app;
 window.ui = ui;
 
-// 修复：确保 UI 初始化完成后再启动 App
 setTimeout(() => {
   ui.init();
   app.init();
