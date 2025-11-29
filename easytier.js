@@ -1,7 +1,6 @@
 (function(){
 'use strict';
 
-// --- 配置区域 ---
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
@@ -17,27 +16,20 @@ const CONST = {
   SYNC_LIMIT: 100
 };
 
-// --- 数据库模块 ---
 const db = {
   _db: null,
   async init() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open('P1_Gossip_DB', 1);
+      const req = indexedDB.open('P1_DB', 1);
       req.onupgradeneeded = (e) => {
         const d = e.target.result;
-        if(!d.objectStoreNames.contains('msgs')) {
-          const store = d.createObjectStore('msgs', { keyPath: 'id' });
-          store.createIndex('ts', 'ts', { unique: false });
-        }
-        if(!d.objectStoreNames.contains('pending')) {
-          d.createObjectStore('pending', { keyPath: 'id' });
-        }
+        if(!d.objectStoreNames.contains('msgs')) d.createObjectStore('msgs', { keyPath: 'id' }).createIndex('ts', 'ts', { unique: false });
+        if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending', { keyPath: 'id' });
       };
       req.onsuccess = (e) => { this._db = e.target.result; resolve(); };
       req.onerror = (e) => reject(e);
     });
   },
-  
   async saveMsg(msg) {
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readwrite');
@@ -45,99 +37,79 @@ const db = {
       tx.oncomplete = () => resolve();
     });
   },
-
   async getRecent(limit, beforeTs = Date.now()) {
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readonly');
-      const index = tx.objectStore('msgs').index('ts');
       const range = IDBKeyRange.upperBound(beforeTs, true);
-      const req = index.openCursor(range, 'prev');
+      const req = tx.objectStore('msgs').index('ts').openCursor(range, 'prev');
       const res = [];
       req.onsuccess = (e) => {
         const cursor = e.target.result;
-        if(cursor && res.length < limit) {
-          res.unshift(cursor.value);
-          cursor.continue();
-        } else {
-          resolve(res);
-        }
+        if(cursor && res.length < limit) { res.unshift(cursor.value); cursor.continue(); }
+        else resolve(res);
       };
     });
   },
-
   async getAfter(limit, afterTs) {
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readonly');
-      const index = tx.objectStore('msgs').index('ts');
       const range = IDBKeyRange.lowerBound(afterTs, true);
-      const req = index.openCursor(range, 'next');
+      const req = tx.objectStore('msgs').index('ts').openCursor(range, 'next');
       const res = [];
       req.onsuccess = (e) => {
         const cursor = e.target.result;
-        if(cursor && res.length < limit) {
-          res.push(cursor.value);
-          cursor.continue();
-        } else {
-          resolve(res);
-        }
+        if(cursor && res.length < limit) { res.push(cursor.value); cursor.continue(); }
+        else resolve(res);
       };
     });
   },
-
   async addPending(msg) {
-    const tx = this._db.transaction(['pending'], 'readwrite');
-    tx.objectStore('pending').put(msg);
+    this._db.transaction(['pending'], 'readwrite').objectStore('pending').put(msg);
   },
-
   async getPending() {
     return new Promise(resolve => {
-      const tx = this._db.transaction(['pending'], 'readonly');
-      const req = tx.objectStore('pending').getAll();
+      const req = this._db.transaction(['pending'], 'readonly').objectStore('pending').getAll();
       req.onsuccess = () => resolve(req.result);
     });
   },
-
   async removePending(id) {
-    const tx = this._db.transaction(['pending'], 'readwrite');
-    tx.objectStore('pending').delete(id);
+    this._db.transaction(['pending'], 'readwrite').objectStore('pending').delete(id);
   }
 };
 
-// --- 全局状态 ---
 const state = {
   myId: null, isSeed: false, peer: null,
   activeConns: new Map(), knownPeers: new Set(), seenMsgs: new Set(),
-  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*10000),
-  latestTs: 0,
-  oldestTs: Date.now(), // 内存中最早消息的时间，用于分页
-  loading: false
+  myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
+  latestTs: 0, oldestTs: Date.now(), loading: false
 };
 
-// --- 工具函数 ---
 const util = {
-  log(s) { console.log(`[Gossip] ${s}`); },
+  log(s) { 
+    const el = document.getElementById('logContent');
+    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 2000);
+    console.log(`[P1] ${s}`); 
+  },
   uuid() { return Math.random().toString(36).substr(2, 9) + Date.now().toString(36); },
   escape(s) {
     return (s||'').toString().replace(/\x26/g, '\x26amp;').replace(/\x3c/g, '\x26lt;').replace(/\x3e/g, '\x26gt;').replace(/\x22/g, '\x26quot;').replace(/\x27/g, '\x26#039;');
   }
 };
 
-// --- 核心逻辑 ---
 const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
-    
     await db.init();
     
-    // 初始加载20条
     await this.loadHistory(20);
 
-    // 启动 P2P
     const seedId = `p1-seed-${Math.floor(Math.random() * CONST.SEED_COUNT)}`;
+    util.log(`正在连接网络...`);
+    
     try {
       await this.startPeer(seedId);
       state.isSeed = true;
-      util.log(`我是基站: ${seedId}`);
+      util.log(`我是基站节点: ${seedId}`);
     } catch (e) {
       await this.startPeer('u_' + util.uuid());
       this.connect(seedId);
@@ -155,7 +127,7 @@ const core = {
     state.loading = true;
     const msgs = await db.getRecent(limit, state.oldestTs);
     if(msgs.length > 0) {
-      state.oldestTs = msgs[0].ts; // 更新最早时间边界
+      state.oldestTs = msgs[0].ts;
       state.latestTs = Math.max(state.latestTs, msgs[msgs.length-1].ts);
       msgs.forEach(m => {
         state.seenMsgs.add(m.id);
@@ -169,7 +141,7 @@ const core = {
     return new Promise((resolve, reject) => {
       const p = new Peer(id, CONFIG);
       p.on('open', pid => { state.myId = pid; state.peer = p; if(window.ui) window.ui.updateSelf(); resolve(); });
-      p.on('error', e => { if(e.type==='unavailable-id') reject(e); });
+      p.on('error', e => { if(e.type==='unavailable-id') reject(e); else util.log(`Error: ${e.type}`); });
       p.on('connection', c => this.handleConn(c));
     });
   },
@@ -282,14 +254,15 @@ const core = {
   }
 };
 
-// --- UI 逻辑 (增强版) ---
 const ui = {
   init() {
     const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
+    
     bind('btnSend', () => {
       const el = document.getElementById('editor');
       if(el.innerText.trim()) { core.sendMsg(el.innerText.trim()); el.innerText=''; }
     });
+    
     const editor = document.getElementById('editor');
     if(editor) {
       editor.addEventListener('paste', e => {
@@ -297,9 +270,26 @@ const ui = {
         document.execCommand('insertText', false, (e.clipboardData||window.clipboardData).getData('text/plain'));
       });
     }
-    bind('btnToggleLog', () => { const el = document.getElementById('miniLog'); el.style.display = el.style.display === 'flex'?'none':'flex'; });
     
-    // 文件上传
+    // 恢复日志开关
+    bind('btnToggleLog', () => { 
+      const el = document.getElementById('miniLog'); 
+      el.style.display = el.style.display === 'flex' ? 'none' : 'flex'; 
+    });
+    
+    // 恢复设置功能
+    bind('btnSettings', () => {
+       document.getElementById('settings-panel').style.display = 'grid';
+       document.getElementById('iptNick').value = state.myName;
+    });
+    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
+    bind('btnSave', () => {
+       const n = document.getElementById('iptNick').value.trim();
+       if(n) { state.myName = n; localStorage.setItem('nickname', n); ui.updateSelf(); }
+       document.getElementById('settings-panel').style.display = 'none';
+    });
+
+    // 恢复文件发送
     bind('btnFile', () => document.getElementById('fileInput').click());
     document.getElementById('fileInput').onchange = function(e) {
       const f = e.target.files[0];
@@ -310,25 +300,26 @@ const ui = {
       this.value = '';
     };
 
-    // 滚动加载历史
+    // 滚动加载
     const box = document.getElementById('msgList');
     box.addEventListener('scroll', () => {
-      if(box.scrollTop === 0) {
-        core.loadHistory(20);
-      }
+      if(box.scrollTop === 0) core.loadHistory(20);
     });
+    
+    // 汉化标题
+    document.getElementById('chatTitle').innerText = '公共频道';
   },
 
   updateSelf() {
-    document.getElementById('myId').innerText = state.myId.slice(0,8);
+    document.getElementById('myId').innerText = state.myId.slice(0,6);
     document.getElementById('myNick').innerText = state.myName;
-    document.getElementById('statusText').innerText = state.isSeed ? '基站' : '节点';
+    document.getElementById('statusText').innerText = state.isSeed ? '基站' : '在线';
     document.getElementById('statusDot').className = 'dot online';
   },
 
   renderStat() {
     document.getElementById('onlineCount').innerText = `${state.activeConns.size}/${state.knownPeers.size}`;
-    let html = `<div style="padding:10px;font-size:12px;color:#666">SYNC MESH<br>Active: ${state.activeConns.size} | Known: ${state.knownPeers.size}</div>`;
+    let html = `<div style="padding:10px;font-size:12px;color:#666">网络拓扑<br>直连: ${state.activeConns.size} | 已知: ${state.knownPeers.size}</div>`;
     state.activeConns.forEach((c, pid) => {
       html += `<div class="contact-item"><div class="avatar" style="background:#22c55e;width:24px;height:24px;font-size:10px">🔗</div><div class="c-info"><div class="c-name" style="font-size:12px">${pid.slice(0,8)}</div></div></div>`;
     });
@@ -337,7 +328,7 @@ const ui = {
 
   appendMsg(m) {
     const box = document.getElementById('msgList');
-    if(document.getElementById('msg-'+m.id)) return; // 去重
+    if(document.getElementById('msg-'+m.id)) return;
     
     let content = util.escape(m.txt);
     const isMe = m.n === state.myName;
@@ -354,38 +345,25 @@ const ui = {
         </div>
       </div>`;
 
-    // 插入排序：找到第一个时间戳比当前消息大的元素，插在它前面
     const children = Array.from(box.children);
     let inserted = false;
-    
-    // 倒序查找可能更快（因为新消息通常在最后）
     for (let i = children.length - 1; i >= 0; i--) {
       const el = children[i];
       const ts = parseInt(el.getAttribute('data-ts') || '0');
       if (m.ts >= ts) {
-        // 插在这个元素后面
-        if (i === children.length - 1) {
-          box.insertAdjacentHTML('beforeend', html);
-        } else {
-          children[i+1].insertAdjacentHTML('beforebegin', html);
-        }
+        if (i === children.length - 1) box.insertAdjacentHTML('beforeend', html);
+        else children[i+1].insertAdjacentHTML('beforebegin', html);
         inserted = true;
         break;
       }
     }
-    
-    // 如果没找到比它小的，说明它是最早的，插在最前面
     if (!inserted) {
       if (children.length === 0) box.innerHTML = html;
       else box.insertAdjacentHTML('afterbegin', html);
     }
 
-    // 如果是最新消息（在底部），或者是我发的，自动滚动到底部
-    // 否则（比如正在看历史消息）保持滚动位置
     const isAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 100;
-    if (isMe || isAtBottom) {
-      box.scrollTop = box.scrollHeight;
-    }
+    if (isMe || isAtBottom) box.scrollTop = box.scrollHeight;
   }
 };
 
