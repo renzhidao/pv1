@@ -27,8 +27,7 @@ const app = {
   roomId: getRoomId(),
 
   log(s) {
-    const el = document.getElementById('miniLog');
-    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 200);
+    // 移除底部干扰，保留内部逻辑但不输出到界面
   },
 
   init() {
@@ -38,9 +37,8 @@ const app = {
     // 修复2：增强心跳，死命重连
     setInterval(() => {
       this.cleanup();
-      this.roomId = getRoomId(); // 更新房间号
+      this.roomId = getRoomId(); 
       
-      // 1. 如果我不是 Hub，且没连上 Hub，必须连 Hub
       if (!this.isHub) {
         const hubConn = this.conns[this.roomId];
         if (!hubConn || !hubConn.open) {
@@ -48,7 +46,6 @@ const app = {
         }
       }
       
-      // 2. 自动重连通讯录里的老友
       Object.values(this.contacts).forEach(c => {
         if(c.id && c.id !== this.myId && (!this.conns[c.id] || !this.conns[c.id].open)) {
            this.connectTo(c.id);
@@ -75,10 +72,7 @@ const app = {
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
-        this.log(`✅ 上线: ${this.myName}`);
         ui.updateSelf();
-        
-        // 启动即尝试连房
         this.connectTo(this.roomId);
       });
 
@@ -86,17 +80,13 @@ const app = {
         // 修复3：如果房间号没人用，我来当房主
         if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
            if(!this.isHub) {
-             this.log('🚨 房间空闲，正在上位...');
              this.isHub = true;
-             // 销毁旧连接，用 RoomID 重生
              this.peer.destroy();
              setTimeout(() => this.initPeer(this.roomId), 500);
            }
         }
         else if (err.type === 'unavailable-id') {
-           // 如果我想当房主但被占了，回退到普通 ID
            if(id === this.roomId) {
-             this.log('👑 席位已满，转普通节点');
              this.isHub = false;
              this.initPeer(this.myId); 
            }
@@ -104,7 +94,7 @@ const app = {
       });
 
       p.on('connection', conn => this.setupConn(conn));
-    } catch(e) { this.log('Fatal: '+e); }
+    } catch(e) { console.error(e); }
   },
 
   connectTo(id) {
@@ -119,16 +109,13 @@ const app = {
     conn.on('open', () => {
       this.conns[conn.peer] = conn;
       ui.renderList();
-      // 握手
       conn.send({t: 'HELLO', n: this.myName, id: this.myId});
-      // 立即交换通讯录
       this.exchange();
     });
 
     conn.on('data', d => {
       if(d.t === 'HELLO') {
         conn.label = d.n;
-        // 更新通讯录，确保 ID 对应
         this.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(this.contacts));
         ui.renderList();
@@ -146,10 +133,14 @@ const app = {
         this.seen.add(d.id);
         
         const key = d.target === 'all' ? 'all' : d.senderName;
+        // 只要我不是发送者，且当前窗口不是该聊天，就增加红点
+        // 修复：公共频道红点支持
+        const isTargetChat = (d.target === 'all' && ui.activeChatName === '公共频道') || (d.senderName === ui.activeChatName);
+        
         if(d.target === 'all' || d.target === this.myName) {
           this.saveMsg(key, d.txt, false, d.senderName);
-          if(d.target !== 'all' && ui.activeChatName !== d.senderName) {
-            this.addUnread(d.senderName);
+          if(!isTargetChat) {
+            this.addUnread(d.target === 'all' ? '公共频道' : d.senderName);
           }
         }
         if(d.target === 'all') this.flood(d, conn.peer);
@@ -183,7 +174,6 @@ const app = {
       if(this.conns[cid] && this.conns[cid].open) this.conns[cid].send(pkt);
       else {
         if(cid) this.connectTo(cid);
-        // 存入待发送队列或重试逻辑省略，保持最简，依赖自动重连
       }
     }
   },
@@ -216,7 +206,6 @@ const app = {
   
   exchange() {
     const list = Object.values(this.contacts).map(c => c.id).filter(id => id);
-    // 也把我知道的在线人推出去
     const onlines = Object.keys(this.conns);
     const fullList = [...new Set([...list, ...onlines])];
     const pkt = {t: 'PEER_EX', list: fullList};
@@ -311,10 +300,18 @@ const ui = {
     const list = document.getElementById('contactList');
     document.getElementById('onlineCount').innerText = Object.keys(app.conns).length;
     
+    // 修复：公共频道红点显示
+    const pubUnread = app.unread['公共频道'] || 0;
+    
     let html = `
       <div class="contact-item ${this.activeChatName==='公共频道'?'active':''}" onclick="ui.switchChat('公共频道', null)">
         <div class="avatar" style="background:#2a7cff">群</div>
-        <div class="c-info"><div class="c-name">公共频道</div></div>
+        <div class="c-info">
+          <div class="c-name">
+            公共频道
+            ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}
+          </div>
+        </div>
       </div>
     `;
     

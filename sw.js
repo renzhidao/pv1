@@ -1,2 +1,2 @@
-self.addEventListener('install', e => e.waitUntil(caches.open('p1-v102').then(c => c.addAll(['./', './index.html', './easytier.js']))));
+self.addEventListener('install', e => e.waitUntil(caches.open('p1-v103').then(c => c.addAll(['./', './index.html', './easytier.js']))));
 self.addEventListener('fetch', e => e.respondWith(fetch(e.request).catch(() => caches.match(e.request))));
