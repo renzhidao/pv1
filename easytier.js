@@ -9,8 +9,8 @@ const CONFIG = {
 };
 
 const CONST = {
-  SEED_COUNT: 5, // 缩小范围，集中火力让大家撞在一起
-  MAX_PEERS: 12, // 稍微放宽连接数，允许同时连多个房主
+  SEED_COUNT: 5, 
+  MAX_PEERS: 12, 
   MIN_PEERS: 4,
   PEX_INTERVAL: 8000,
   TTL: 16,
@@ -103,11 +103,7 @@ const core = {
     
     setInterval(() => {
       this.cleanup();
-      
-      // 核心逻辑：始终尝试连接所有固定的种子房主
-      // 这样中间人就能同时连上 A 和 B，把他们拉到一起
       this.connectToSeeds();
-      
       this.sendPing();
       this.retryPending(); 
       this.exchange(); 
@@ -118,7 +114,7 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v9 多中心融合版)`);
+    util.log(`🚀 启动 (v9.1 UI修复版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
@@ -132,13 +128,9 @@ const core = {
       
       p.on('error', err => {
         util.log(`PeerErr: ${err.type}`);
-        // 抢位逻辑：只有当我是“孤儿”且连不上别人时，才尝试抢位
-        // 这里的逻辑是：遍历抢占 p1-seed-0 到 p1-seed-4
         if (err.type === 'peer-unavailable' && err.message.includes('p1-seed-')) {
-           // 某个种子位空闲，但我不要立刻抢，防止网络抖动
-           // 只有当我一个连接都没有时，才去填补空位
            if(Object.keys(state.conns).length === 0 && !state.isHub) {
-             const targetSeed = err.message.split(' ').pop(); // 获取空闲的种子ID
+             const targetSeed = err.message.split(' ').pop(); 
              this.tryBecomeHub(targetSeed);
            }
         }
@@ -162,7 +154,6 @@ const core = {
         if(window.ui) window.ui.updateSelf();
       });
       p2.on('error', () => {
-        // 抢失败了（可能被别人抢了），回退
         state.isHub = false;
         setTimeout(() => this.startPeer(), 1000);
       });
@@ -171,7 +162,6 @@ const core = {
   },
 
   connectToSeeds() {
-    // 核心：遍历所有种子位 (0-4)
     for(let i=0; i<CONST.SEED_COUNT; i++) {
       const s = `p1-seed-${i}`;
       if(s !== state.myId) this.connectTo(s);
@@ -194,10 +184,10 @@ const core = {
   setupConn(conn) {
     conn.on('open', () => {
       state.conns[conn.peer] = conn;
-      // 握手包带上我的人口数 (pop)，用于比大小
       conn.send({t: 'HELLO', n: state.myName, id: state.myId, pop: Object.keys(state.conns).length});
       this.exchange(); 
       this.retryPending();
+      if(window.ui) window.ui.renderList(); // 连上时刷新列表
     });
 
     conn.on('data', d => this.handleData(d, conn));
@@ -213,16 +203,14 @@ const core = {
       conn.label = d.n;
       state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
       
-      // 房主合并逻辑：如果我是房主，对方也是房主（种子），且对方人多/ID小 -> 我投降
       if (state.isHub && d.id.includes('p1-seed-')) {
         const myPop = Object.keys(state.conns).length;
         const theirPop = d.pop || 0;
-        // 规则：人少的投降；人一样，ID大的投降
         if (theirPop > myPop + 2 || (Math.abs(theirPop - myPop) <= 2 && d.id < state.myId)) {
           util.log(`🏳️ 发现更强房主 ${d.id}，正在合并...`);
           state.isHub = false;
           state.peer.destroy();
-          setTimeout(() => this.startPeer(), 1000); // 重启为普通节点，自动会被 connectToSeeds 拉过去
+          setTimeout(() => this.startPeer(), 1000); 
           return;
         }
       }
@@ -292,7 +280,7 @@ const core = {
   async retryPending() {
     const list = await db.getPending();
     if(list.length === 0) return;
-    const ready = Object.keys(state.conns).length > 0;
+    const ready = Object.keys(state.conns).some(k => state.conns[k].open); // 必须 open 才能发
     if(!ready) return;
 
     list.forEach(async pkt => {
@@ -315,6 +303,7 @@ const core = {
       const c = state.conns[pid];
       if(!c.open && (now - (c.created || 0) > 10000)) {
         delete state.conns[pid]; 
+        if(window.ui) window.ui.renderList(); // 状态变化刷新UI
       }
     }); 
   },
@@ -401,7 +390,10 @@ const ui = {
 
   renderList() {
     const list = document.getElementById('contactList');
-    document.getElementById('onlineCount').innerText = Object.keys(state.conns).length;
+    // 修复：只统计真正 open 的连接
+    const onlineCount = Object.values(state.conns).filter(c => c.open).length;
+    document.getElementById('onlineCount').innerText = onlineCount;
+    
     const pubUnread = state.unread['all'] || 0;
     let html = `
       <div class="contact-item ${state.activeChat==='all'?'active':''}" onclick="ui.switchChat('all', '公共频道')">
@@ -421,12 +413,15 @@ const ui = {
     map.forEach((v, id) => {
       if(id === state.myId) return; 
       
-      const unread = state.unread[id] || 0;
-      const isOnline = !!state.conns[id];
-      let name = util.escape(v.n || '未知');
+      // 修复：隐藏未连接的种子节点，只显示已连接的或普通用户
+      const isSeed = id.includes('p1-seed-');
+      const isOnline = state.conns[id] && state.conns[id].open;
       
-      // 美化房主显示
-      if(id.includes('p1-seed-')) name = '👑 ' + id;
+      if (isSeed && !isOnline) return; // 隐藏离线种子
+
+      const unread = state.unread[id] || 0;
+      let name = util.escape(v.n || '未知');
+      if(isSeed) name = '👑 ' + id;
       
       html += `
         <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">
