@@ -4,7 +4,7 @@
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
-  debug: 1 // 1=Errors, 2=All. 降噪模式
+  debug: 1
 };
 
 const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 600000);
@@ -22,11 +22,12 @@ const app = {
   
   isHub: false,
   roomId: getRoomId(),
+  lastPong: {},
 
   log(s) {
     const el = document.getElementById('logContent');
     if(el) {
-      if(s.includes('peer-unavailable')) { console.log(s); return; } // 屏蔽刷屏
+      if(s.includes('peer-unavailable')) { console.log(s); return; }
       const time = new Date().toLocaleTimeString();
       el.innerText = `[${time}] ${s}\n` + el.innerText.slice(0, 10000);
     }
@@ -34,17 +35,17 @@ const app = {
   },
 
   init() {
+    if(typeof Peer === 'undefined') {
+      console.error('PeerJS not loaded');
+      return;
+    }
     localStorage.setItem('p1_my_id', this.myId);
-    this.log(` 启动 | ID: ${this.myId}`);
+    this.log(`🚀 启动 | ID: ${this.myId}`);
     
-    // 修复1: 刷新前自杀，释放ID
-    window.addEventListener('beforeunload', () => {
-      if(this.peer) this.peer.destroy();
-    });
+    window.addEventListener('beforeunload', () => { if(this.peer) this.peer.destroy(); });
 
     this.start();
     
-    // 修复2: 启动即连老友
     Object.values(this.contacts).forEach(c => {
       if(c.id && c.id !== this.myId) this.connectTo(c.id);
     });
@@ -53,16 +54,25 @@ const app = {
       this.cleanup();
       this.roomId = getRoomId(); 
       
-      // 房主保活
       if (!this.isHub) {
         const hubConn = this.conns[this.roomId];
         if (!hubConn || !hubConn.open) this.connectTo(this.roomId);
       }
       
-      // 邻居保活
       Object.values(this.contacts).forEach(c => {
         if(c.id && c.id !== this.myId && (!this.conns[c.id] || !this.conns[c.id].open)) {
            this.connectTo(c.id);
+        }
+      });
+
+      this.sendPing();
+      
+      const now = Date.now();
+      Object.keys(this.conns).forEach(pid => {
+        if (this.conns[pid].open && this.lastPong[pid] && (now - this.lastPong[pid] > 15000)) {
+          this.conns[pid].close();
+          delete this.conns[pid];
+          this.connectTo(pid);
         }
       });
 
@@ -70,7 +80,10 @@ const app = {
     }, 5000);
 
     document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState === 'visible') this.start();
+      if(document.visibilityState === 'visible') {
+        this.start();
+        this.sendPing();
+      }
     });
   },
 
@@ -88,18 +101,17 @@ const app = {
         this.myId = myId;
         this.peer = p;
         this.log(`✅ 上线成功`);
-        ui.updateSelf();
+        if(window.ui && ui.updateSelf) ui.updateSelf();
         this.connectTo(this.roomId);
       });
 
       p.on('error', err => {
-        // 修复3: 错峰抢房主
         if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
            if(!this.isHub) {
-             const delay = 500 + Math.random() * 1500; // 随机延迟
+             const delay = 500 + Math.random() * 1500;
              setTimeout(() => {
                if(!this.isHub && (!this.conns[this.roomId] || !this.conns[this.roomId].open)) {
-                 this.log(`👑 尝试接管房间 (延${Math.floor(delay)}ms)`);
+                 this.log(`👑 尝试接管房间`);
                  this.isHub = true;
                  this.peer.destroy();
                  setTimeout(() => this.initPeer(this.roomId), 100);
@@ -109,7 +121,7 @@ const app = {
         }
         else if (err.type === 'unavailable-id') {
            if(id === this.roomId) {
-             this.log(`⚠️ 抢位失败，回退`);
+             this.log(`⚠️ 抢位失败`);
              this.isHub = false;
              setTimeout(() => this.initPeer(this.myId), 500);
            }
@@ -131,18 +143,30 @@ const app = {
   setupConn(conn) {
     conn.on('open', () => {
       this.conns[conn.peer] = conn;
-      ui.renderList();
+      this.lastPong[conn.peer] = Date.now();
+      if(window.ui && ui.renderList) ui.renderList();
       conn.send({t: 'HELLO', n: this.myName, id: this.myId});
       this.exchange();
     });
 
     conn.on('data', d => {
+      if (d.t === 'PING') {
+        conn.send({t: 'PONG'});
+        return;
+      }
+      if (d.t === 'PONG') {
+        this.lastPong[conn.peer] = Date.now();
+        return;
+      }
+
       if(d.t === 'HELLO') {
         conn.label = d.n;
         this.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(this.contacts));
-        ui.renderList();
-        if(ui.activeChatName === d.n) ui.switchChat(d.n, conn.peer);
+        if(window.ui) {
+          ui.renderList();
+          if(ui.activeChatName === d.n) ui.switchChat(d.n, conn.peer);
+        }
       }
       
       if(d.t === 'PEER_EX') {
@@ -156,21 +180,31 @@ const app = {
         this.seen.add(d.id);
         this.log(`📨 消息 from ${d.senderName}`);
         
-        const key = d.target === 'all' ? 'all' : d.senderName;
-        const isTargetChat = (d.target === 'all' && ui.activeChatName === '公共频道') || (d.senderName === ui.activeChatName);
-        
-        if(d.target === 'all' || d.target === this.myName) {
-          this.saveMsg(key, d.txt, false, d.senderName);
-          if(!isTargetChat) {
-            this.addUnread(d.target === 'all' ? '公共频道' : d.senderName);
+        if(window.ui) {
+          const key = d.target === 'all' ? 'all' : d.senderName;
+          const isTargetChat = (d.target === 'all' && ui.activeChatName === '公共频道') || (d.senderName === ui.activeChatName);
+          
+          if(d.target === 'all' || d.target === this.myName) {
+            this.saveMsg(key, d.txt, false, d.senderName);
+            if(!isTargetChat) {
+              this.addUnread(d.target === 'all' ? '公共频道' : d.senderName);
+            }
           }
         }
         if(d.target === 'all') this.flood(d, conn.peer);
       }
     });
 
-    conn.on('close', () => { delete this.conns[conn.peer]; ui.renderList(); });
-    conn.on('error', () => { delete this.conns[conn.peer]; ui.renderList(); });
+    conn.on('close', () => { delete this.conns[conn.peer]; if(window.ui) ui.renderList(); });
+    conn.on('error', () => { delete this.conns[conn.peer]; if(window.ui) ui.renderList(); });
+  },
+
+  sendPing() {
+    Object.values(this.conns).forEach(c => {
+      if(c.open) {
+        try { c.send({t: 'PING'}); } catch(e){}
+      }
+    });
   },
 
   flood(pkt, exclude) {
@@ -208,19 +242,19 @@ const app = {
     this.msgs[key].push(m);
     if(this.msgs[key].length > 50) this.msgs[key].shift();
     localStorage.setItem('p1_msgs', JSON.stringify(this.msgs));
-    if(ui.activeChatName === key || (key==='all' && ui.activeChatName==='公共频道')) ui.appendMsg(m);
+    if(window.ui && (ui.activeChatName === key || (key==='all' && ui.activeChatName==='公共频道'))) ui.appendMsg(m);
   },
   
   addUnread(name) {
     this.unread[name] = (this.unread[name] || 0) + 1;
     localStorage.setItem('p1_unread', JSON.stringify(this.unread));
-    ui.renderList();
+    if(window.ui) ui.renderList();
   },
   clearUnread(name) {
     if(this.unread[name]) {
       delete this.unread[name];
       localStorage.setItem('p1_unread', JSON.stringify(this.unread));
-      ui.renderList();
+      if(window.ui) ui.renderList();
     }
   },
 
@@ -380,7 +414,7 @@ const ui = {
   appendMsg(m) {
     const box = document.getElementById('msgList');
     let content = m.txt;
-    content = content.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    content = content.replace(/</g, '<').replace(/>/g, '>');
     content = content.replace(/\[img\](.*?)\[\/img\]/g, '<img src="$1" class="chat-img" onclick="window.open(this.src)">');
     content = content.replace(/\[file=(.*?)\](.*?)\[\/file\]/g, '<a href="$2" download="$1" style="color:var(--text);text-decoration:underline;display:block;margin-top:5px">📄 $1</a>');
     
@@ -397,7 +431,11 @@ const ui = {
 
 window.app = app;
 window.ui = ui;
-app.init();
-setTimeout(() => ui.init(), 500);
+
+// 修复：确保 UI 初始化完成后再启动 App
+setTimeout(() => {
+  ui.init();
+  app.init();
+}, 500);
 
 })();
