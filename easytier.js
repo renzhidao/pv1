@@ -1,18 +1,15 @@
 (function(){
 'use strict';
 
-// ===================== 逃生通道配置 =====================
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
-  debug: 2 // 开启详细调试
+  debug: 2
 };
 
-// 动态房间号：每10分钟换一个
 const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 600000);
 
 const app = {
-  // 核心：固定 ID
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
   
@@ -26,57 +23,41 @@ const app = {
   isHub: false,
   roomId: getRoomId(),
 
-  // 全量日志系统
+  // 核心：日志输出到独立容器
   log(s) {
-    const el = document.getElementById('miniLog');
+    const el = document.getElementById('logContent');
     if(el) {
       const time = new Date().toLocaleTimeString();
-      // 记录最近 5000 字日志
-      el.innerText = `[${time}] ${s}\n` + el.innerText.slice(0, 5000);
+      el.innerText = `[${time}] ${s}\n` + el.innerText.slice(0, 10000);
     }
     console.log(`[P1] ${s}`);
   },
 
   init() {
     localStorage.setItem('p1_my_id', this.myId);
-    this.log(`🚀 启动应用 | ID: ${this.myId} | 房号: ${this.roomId}`);
+    this.log(`🚀 应用启动 | ID: ${this.myId}`);
     this.start();
     
-    // 心跳与重连循环
     setInterval(() => {
       this.cleanup();
-      const newRoom = getRoomId();
-      if(newRoom !== this.roomId) {
-        this.log(`🔄 房间号轮换: ${this.roomId} -> ${newRoom}`);
-        this.roomId = newRoom;
-      }
+      this.roomId = getRoomId(); 
       
-      // 1. 确保连上公共房间
       if (!this.isHub) {
         const hubConn = this.conns[this.roomId];
-        if (!hubConn || !hubConn.open) {
-          this.connectTo(this.roomId);
-        }
+        if (!hubConn || !hubConn.open) this.connectTo(this.roomId);
       }
       
-      // 2. 扫描通讯录，死命重连掉线好友
-      let dead = 0;
       Object.values(this.contacts).forEach(c => {
         if(c.id && c.id !== this.myId && (!this.conns[c.id] || !this.conns[c.id].open)) {
            this.connectTo(c.id);
-           dead++;
         }
       });
-      if(dead > 0) this.log(`💓 心跳检查: 尝试召回 ${dead} 位老友`);
 
       this.exchange();
     }, 5000);
 
     document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState === 'visible') {
-        this.log('👁️ 前台唤醒，立即重连...');
-        this.start();
-      }
+      if(document.visibilityState === 'visible') this.start();
     });
   },
 
@@ -87,22 +68,21 @@ const app = {
 
   initPeer(id) {
     try {
-      this.log(`🔌 连接 PeerServer...`);
+      this.log(`🔌 正在连接...`);
       const p = new Peer(id, CONFIG);
       
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
-        this.log(`✅ ID确认: ${myId}`);
+        this.log(`✅ 连接成功，我是: ${this.myName}`);
         ui.updateSelf();
         this.connectTo(this.roomId);
       });
 
       p.on('error', err => {
-        this.log(`❌ PeerError: ${err.type}`);
+        this.log(`❌ Err: ${err.type}`);
         if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
            if(!this.isHub) {
-             this.log(' 房间无人，晋升为 Hub');
              this.isHub = true;
              this.peer.destroy();
              setTimeout(() => this.initPeer(this.roomId), 500);
@@ -110,32 +90,26 @@ const app = {
         }
         else if (err.type === 'unavailable-id') {
            if(id === this.roomId) {
-             this.log('⚠️ Hub位被占，降级为 Client');
              this.isHub = false;
              this.initPeer(this.myId); 
            }
         }
       });
 
-      p.on('connection', conn => {
-        this.log(`📥 收到连接: ${conn.peer.slice(0,5)}...`);
-        this.setupConn(conn);
-      });
-    } catch(e) { this.log(`🔥 InitFailed: ${e}`); }
+      p.on('connection', conn => this.setupConn(conn));
+    } catch(e) { this.log(`🔥 Fatal: ${e}`); }
   },
 
   connectTo(id) {
     if(!this.peer || this.peer.destroyed || id === this.myId || (this.conns[id] && this.conns[id].open)) return;
     try {
-      // this.log(`⚡ 发起连接 -> ${id.slice(0,5)}...`);
       const conn = this.peer.connect(id, {reliable: true});
       this.setupConn(conn);
-    } catch(e){ this.log(`ConnectEx: ${e}`); }
+    } catch(e){}
   },
 
   setupConn(conn) {
     conn.on('open', () => {
-      this.log(`🤝 连接建立: ${conn.label||conn.peer.slice(0,5)}`);
       this.conns[conn.peer] = conn;
       ui.renderList();
       conn.send({t: 'HELLO', n: this.myName, id: this.myId});
@@ -144,7 +118,6 @@ const app = {
 
     conn.on('data', d => {
       if(d.t === 'HELLO') {
-        this.log(`👋 握手成功: ${d.n}`);
         conn.label = d.n;
         this.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(this.contacts));
@@ -161,7 +134,7 @@ const app = {
       if(d.t === 'MSG') {
         if(this.seen.has(d.id)) return;
         this.seen.add(d.id);
-        this.log(`📨 收到消息 [${d.target}] 来自 ${d.senderName}`);
+        this.log(`📨 收到消息 from ${d.senderName}`);
         
         const key = d.target === 'all' ? 'all' : d.senderName;
         const isTargetChat = (d.target === 'all' && ui.activeChatName === '公共频道') || (d.senderName === ui.activeChatName);
@@ -172,23 +145,12 @@ const app = {
             this.addUnread(d.target === 'all' ? '公共频道' : d.senderName);
           }
         }
-        if(d.target === 'all') {
-          // this.log(`📢 广播转发消息...`);
-          this.flood(d, conn.peer);
-        }
+        if(d.target === 'all') this.flood(d, conn.peer);
       }
     });
 
-    conn.on('close', () => { 
-      this.log(`🔌 连接断开: ${conn.label||conn.peer.slice(0,5)}`);
-      delete this.conns[conn.peer]; 
-      ui.renderList(); 
-    });
-    conn.on('error', (e) => { 
-      this.log(`⚠️ 连接错误: ${e}`);
-      delete this.conns[conn.peer]; 
-      ui.renderList(); 
-    });
+    conn.on('close', () => { delete this.conns[conn.peer]; ui.renderList(); });
+    conn.on('error', () => { delete this.conns[conn.peer]; ui.renderList(); });
   },
 
   flood(pkt, exclude) {
@@ -204,7 +166,7 @@ const app = {
     const pkt = {t: 'MSG', id, txt, senderName: this.myName, target: targetName==='公共频道'?'all':targetName};
     this.seen.add(id);
     
-    this.log(`📤 发送消息 -> ${targetName}`);
+    this.log(`📤 发送 -> ${targetName}`);
     const key = targetName === '公共频道' ? 'all' : targetName;
     this.saveMsg(key, txt, true, '我');
     
@@ -212,10 +174,9 @@ const app = {
       this.flood(pkt, null);
     } else {
       const cid = this.contacts[targetName]?.id;
-      if(this.conns[cid] && this.conns[cid].open) {
-        this.conns[cid].send(pkt);
-      } else {
-        this.log(`⚠️ 目标断连，尝试重连并排队...`);
+      if(this.conns[cid] && this.conns[cid].open) this.conns[cid].send(pkt);
+      else {
+        this.log(`⚠️ 发送排队，尝试重连...`);
         if(cid) this.connectTo(cid);
       }
     }
@@ -256,7 +217,6 @@ const app = {
   }
 };
 
-// ===================== UI =====================
 const ui = {
   activeChatName: '公共频道',
   activeChatId: null,
@@ -271,11 +231,19 @@ const ui = {
     
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
     
-    // 日志开关 - 纯净版，无点击劫持
+    // 修复：日志开关 + 下载功能
     bind('btnToggleLog', () => {
       const el = document.getElementById('miniLog');
-      el.style.display = el.style.display === 'block' ? 'none' : 'block';
-      app.log(' 日志窗口已开启');
+      el.style.display = el.style.display === 'flex' ? 'none' : 'flex'; // flex显示以支持布局
+    });
+    
+    bind('btnDlLog', () => {
+      const content = document.getElementById('logContent').innerText;
+      const blob = new Blob([content], {type: 'text/plain'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'p1_debug_log.txt';
+      a.click();
     });
     
     bind('btnSettings', () => {
