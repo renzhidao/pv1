@@ -68,13 +68,31 @@ const state = {
   seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
 };
 
-const util = {
-  log: (s) => console.log(`[P1] ${s}`),
-  uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  escape: (s) => {
-    if(!s) return '';
-    return s.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, '&#039;');
+const logSystem = {
+  lastLog: null, count: 1,
+  add(text) {
+    const msg = `[${new Date().toLocaleTimeString()}] ${text}`;
+    console.log(msg);
+    const el = document.getElementById('logContent');
+    if(!el) return;
+    if (this.lastLog === text) {
+      this.count++;
+      if(el.lastChild) el.lastChild.innerText = `${msg} (x${this.count})`;
+    } else {
+      this.count = 1; this.lastLog = text;
+      const div = document.createElement('div');
+      div.innerText = msg; div.style.borderBottom = '1px solid #333';
+      el.appendChild(div);
+      if(el.children.length > 100) el.removeChild(el.firstChild);
+      el.scrollTop = el.scrollHeight;
+    }
   }
+};
+
+const util = {
+  log: (s) => logSystem.add(s),
+  uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
+  escape: (s) => (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
 };
 
 const core = {
@@ -84,7 +102,6 @@ const core = {
     
     await db.init();
     if(window.ui) window.ui.init();
-    
     this.loadHistory(20);
     this.startPeer();
     
@@ -117,19 +134,21 @@ const core = {
       const p = new Peer(state.myId, CONFIG);
       p.on('open', id => {
         state.myId = id; state.peer = p;
-        util.log(`上线: ${id}`);
+        util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
         setTimeout(() => this.connectTo(state.roomId), 500);
       });
       p.on('error', err => {
+        util.log(`PeerErr: ${err.type}`);
         if (err.type === 'peer-unavailable' && err.message.includes('room')) {
            if(!state.isHub) {
+             util.log('🚨 尝试上位...');
              state.isHub = true; state.peer.destroy();
              setTimeout(() => {
                const p2 = new Peer(state.roomId, CONFIG); 
                p2.on('open', () => {
                  state.peer = p2; state.myId = state.roomId;
-                 util.log('成为房主');
+                 util.log('👑 成为房主');
                  if(window.ui) window.ui.updateSelf();
                });
                p2.on('error', e => {
@@ -200,7 +219,7 @@ const core = {
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
         if (state.activeChat === chatKey) {
-          if(window.ui) window.ui.appendMsg(d);
+          if(window.ui) window.ui.appendMsg(d); 
         } else {
           state.unread[chatKey] = (state.unread[chatKey]||0) + 1;
           localStorage.setItem('p1_unread', JSON.stringify(state.unread));
