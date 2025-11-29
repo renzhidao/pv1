@@ -4,7 +4,7 @@
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
-  debug: 2
+  debug: 1 // 1=Errors, 2=All. 降噪模式
 };
 
 const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 600000);
@@ -23,10 +23,10 @@ const app = {
   isHub: false,
   roomId: getRoomId(),
 
-  // 核心：日志输出到独立容器
   log(s) {
     const el = document.getElementById('logContent');
     if(el) {
+      if(s.includes('peer-unavailable')) { console.log(s); return; } // 屏蔽刷屏
       const time = new Date().toLocaleTimeString();
       el.innerText = `[${time}] ${s}\n` + el.innerText.slice(0, 10000);
     }
@@ -35,18 +35,31 @@ const app = {
 
   init() {
     localStorage.setItem('p1_my_id', this.myId);
-    this.log(`🚀 应用启动 | ID: ${this.myId}`);
+    this.log(`🚀 启动 | ID: ${this.myId}`);
+    
+    // 修复1: 刷新前自杀，释放ID
+    window.addEventListener('beforeunload', () => {
+      if(this.peer) this.peer.destroy();
+    });
+
     this.start();
+    
+    // 修复2: 启动即连老友
+    Object.values(this.contacts).forEach(c => {
+      if(c.id && c.id !== this.myId) this.connectTo(c.id);
+    });
     
     setInterval(() => {
       this.cleanup();
       this.roomId = getRoomId(); 
       
+      // 房主保活
       if (!this.isHub) {
         const hubConn = this.conns[this.roomId];
         if (!hubConn || !hubConn.open) this.connectTo(this.roomId);
       }
       
+      // 邻居保活
       Object.values(this.contacts).forEach(c => {
         if(c.id && c.id !== this.myId && (!this.conns[c.id] || !this.conns[c.id].open)) {
            this.connectTo(c.id);
@@ -68,30 +81,37 @@ const app = {
 
   initPeer(id) {
     try {
-      this.log(`🔌 正在连接...`);
+      this.log(`🔌 上线中...`);
       const p = new Peer(id, CONFIG);
       
       p.on('open', myId => {
         this.myId = myId;
         this.peer = p;
-        this.log(`✅ 连接成功，我是: ${this.myName}`);
+        this.log(`✅ 上线成功`);
         ui.updateSelf();
         this.connectTo(this.roomId);
       });
 
       p.on('error', err => {
-        this.log(`❌ Err: ${err.type}`);
+        // 修复3: 错峰抢房主
         if (err.type === 'peer-unavailable' && err.message.includes(this.roomId)) {
            if(!this.isHub) {
-             this.isHub = true;
-             this.peer.destroy();
-             setTimeout(() => this.initPeer(this.roomId), 500);
+             const delay = 500 + Math.random() * 1500; // 随机延迟
+             setTimeout(() => {
+               if(!this.isHub && (!this.conns[this.roomId] || !this.conns[this.roomId].open)) {
+                 this.log(`👑 尝试接管房间 (延${Math.floor(delay)}ms)`);
+                 this.isHub = true;
+                 this.peer.destroy();
+                 setTimeout(() => this.initPeer(this.roomId), 100);
+               }
+             }, delay);
            }
         }
         else if (err.type === 'unavailable-id') {
            if(id === this.roomId) {
+             this.log(`⚠️ 抢位失败，回退`);
              this.isHub = false;
-             this.initPeer(this.myId); 
+             setTimeout(() => this.initPeer(this.myId), 500);
            }
         }
       });
@@ -134,7 +154,7 @@ const app = {
       if(d.t === 'MSG') {
         if(this.seen.has(d.id)) return;
         this.seen.add(d.id);
-        this.log(`📨 收到消息 from ${d.senderName}`);
+        this.log(`📨 消息 from ${d.senderName}`);
         
         const key = d.target === 'all' ? 'all' : d.senderName;
         const isTargetChat = (d.target === 'all' && ui.activeChatName === '公共频道') || (d.senderName === ui.activeChatName);
@@ -176,7 +196,7 @@ const app = {
       const cid = this.contacts[targetName]?.id;
       if(this.conns[cid] && this.conns[cid].open) this.conns[cid].send(pkt);
       else {
-        this.log(`⚠️ 发送排队，尝试重连...`);
+        this.log(`⚠️ 未直连，重连中...`);
         if(cid) this.connectTo(cid);
       }
     }
@@ -231,10 +251,9 @@ const ui = {
     
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
     
-    // 修复：日志开关 + 下载功能
     bind('btnToggleLog', () => {
       const el = document.getElementById('miniLog');
-      el.style.display = el.style.display === 'flex' ? 'none' : 'flex'; // flex显示以支持布局
+      el.style.display = el.style.display === 'flex' ? 'none' : 'flex'; 
     });
     
     bind('btnDlLog', () => {
@@ -361,7 +380,7 @@ const ui = {
   appendMsg(m) {
     const box = document.getElementById('msgList');
     let content = m.txt;
-    content = content.replace(/</g, '<').replace(/>/g, '>');
+    content = content.replace(/</g, '&lt;').replace(/>/g, '&gt;');
     content = content.replace(/\[img\](.*?)\[\/img\]/g, '<img src="$1" class="chat-img" onclick="window.open(this.src)">');
     content = content.replace(/\[file=(.*?)\](.*?)\[\/file\]/g, '<a href="$2" download="$1" style="color:var(--text);text-decoration:underline;display:block;margin-top:5px">📄 $1</a>');
     
