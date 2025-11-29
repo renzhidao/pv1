@@ -9,118 +9,72 @@ const CONFIG = {
 };
 
 const CONST = {
-  MAX_PEERS: 8,
-  MIN_PEERS: 4,
-  PEX_INTERVAL: 10000,
-  TTL: 16,
-  SYNC_LIMIT: 100
+  MAX_PEERS: 8, MIN_PEERS: 4, PEX_INTERVAL: 10000, TTL: 16, SYNC_LIMIT: 100
 };
 
-// --- 2. 数据库 ---
+// --- 2. 数据库 (辅助角色) ---
 const db = {
   _db: null,
   async init() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open('P1_DB', 1);
-      req.onupgradeneeded = (e) => {
+    return new Promise(r => {
+      const req = indexedDB.open('P1_DB', 2);
+      req.onupgradeneeded = e => {
         const d = e.target.result;
         if(!d.objectStoreNames.contains('msgs')) d.createObjectStore('msgs', { keyPath: 'id' }).createIndex('ts', 'ts');
         if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending', { keyPath: 'id' });
       };
-      req.onsuccess = (e) => { this._db = e.target.result; resolve(); };
-      req.onerror = (e) => reject(e);
+      req.onsuccess = e => { this._db = e.target.result; r(); };
+      req.onerror = () => r(); // 失败也不卡死
     });
   },
   async saveMsg(msg) {
-    return new Promise(resolve => {
-      const tx = this._db.transaction(['msgs'], 'readwrite');
-      tx.objectStore('msgs').put(msg);
-      tx.oncomplete = () => resolve();
-    });
+    if(!this._db) return;
+    const tx = this._db.transaction(['msgs'], 'readwrite');
+    tx.objectStore('msgs').put(msg);
   },
   async getRecent(limit, target='all', beforeTs = Date.now()) {
+    if(!this._db) return [];
     return new Promise(resolve => {
       const tx = this._db.transaction(['msgs'], 'readonly');
-      const range = IDBKeyRange.upperBound(beforeTs, true);
-      const req = tx.objectStore('msgs').index('ts').openCursor(range, 'prev');
+      const req = tx.objectStore('msgs').index('ts').openCursor(IDBKeyRange.upperBound(beforeTs, true), 'prev');
       const res = [];
-      req.onsuccess = (e) => {
+      req.onsuccess = e => {
         const cursor = e.target.result;
         if (cursor && res.length < limit) {
           const m = cursor.value;
           const isPublic = target === 'all' && m.target === 'all';
-          const isPrivate = target !== 'all' && ((m.target === target && m.senderId === state.myId) || (m.senderId === target && m.target === state.myId));
+          const isPrivate = target !== 'all' && m.target !== 'all' && ((m.target === target) || (m.senderId === target));
           if (isPublic || isPrivate) res.unshift(m);
           cursor.continue();
         } else resolve(res);
       };
     });
   },
-  async addPending(msg) { this._db.transaction(['pending'], 'readwrite').objectStore('pending').put(msg); },
+  async addPending(msg) { if(this._db) this._db.transaction(['pending'], 'readwrite').objectStore('pending').put(msg); },
   async getPending() {
+    if(!this._db) return [];
     return new Promise(r => {
       const req = this._db.transaction(['pending'], 'readonly').objectStore('pending').getAll();
       req.onsuccess = () => r(req.result);
     });
   },
-  async removePending(id) { this._db.transaction(['pending'], 'readwrite').objectStore('pending').delete(id); }
+  async removePending(id) { if(this._db) this._db.transaction(['pending'], 'readwrite').objectStore('pending').delete(id); }
 };
 
 // --- 3. 全局状态 ---
 const state = {
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
-  peer: null,
-  conns: {}, 
-  contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
-  isHub: false,
-  roomId: '', 
-  
-  activeChat: 'all', activeChatName: '公共频道', 
-  unread: JSON.parse(localStorage.getItem('p1_unread') || '{}'),
+  peer: null, conns: {}, contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
+  isHub: false, roomId: '', 
+  activeChat: 'all', activeChatName: '公共频道', unread: JSON.parse(localStorage.getItem('p1_unread') || '{}'),
   seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
 };
 
-// --- 增强日志系统 ---
-const logSystem = {
-  logs: [],
-  lastLog: null,
-  count: 1,
-  
-  add(text) {
-    const time = new Date().toLocaleTimeString();
-    const msg = `[${time}] ${text}`;
-    
-    if (this.lastLog === text) {
-      this.count++;
-      // 更新最后一条 UI
-      const el = document.getElementById('logContent');
-      if(el && el.lastChild) {
-        el.lastChild.innerText = `${msg} (x${this.count})`;
-      }
-    } else {
-      this.count = 1;
-      this.lastLog = text;
-      this.logs.push(msg);
-      if(this.logs.length > 500) this.logs.shift();
-      
-      const el = document.getElementById('logContent');
-      if(el) {
-        const div = document.createElement('div');
-        div.innerText = msg;
-        div.style.borderBottom = '1px solid #333';
-        el.appendChild(div);
-        el.scrollTop = el.scrollHeight;
-      }
-    }
-    console.log(msg);
-  }
-};
-
 const util = {
-  log: (s) => logSystem.add(s),
+  log: (s) => { console.log(`[P1] ${s}`); }, // 简化日志
   uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  escape: (s) => (s||'').toString().replace(/\x26/g, '\x26amp;').replace(/\x3c/g, '\x26lt;').replace(/\x3e/g, '\x26gt;').replace(/\x22/g, '\x26quot;').replace(/\x27/g, '\x26#039;')
+  escape: (s) => (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
 };
 
 // --- 4. 核心逻辑 ---
@@ -128,10 +82,12 @@ const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
     localStorage.setItem('p1_my_id', state.myId);
-    await db.init();
     
+    await db.init();
     if(window.ui) window.ui.init();
-    await this.loadHistory(20); // 启动加载
+    
+    // 历史记录异步加载，不阻塞启动
+    this.loadHistory(20);
     
     this.startPeer();
     
@@ -148,8 +104,7 @@ const core = {
       Object.values(state.contacts).forEach(c => {
         if(c.lastTry && Date.now() - c.lastTry < 10000) return;
         if(c.id && c.id !== state.myId && (!state.conns[c.id] || !state.conns[c.id].open)) {
-           this.connectTo(c.id);
-           c.lastTry = Date.now();
+           this.connectTo(c.id); c.lastTry = Date.now();
         }
       });
       
@@ -161,45 +116,34 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v9.4 增强版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
       p.on('open', id => {
-        state.myId = id;
-        state.peer = p;
+        state.myId = id; state.peer = p;
         util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
         setTimeout(() => this.connectTo(state.roomId), 500);
       });
-      
       p.on('error', err => {
-        util.log(`PeerErr: ${err.type}`);
         if (err.type === 'peer-unavailable' && err.message.includes('room')) {
            if(!state.isHub) {
-             util.log('🚨 尝试上位...');
-             state.isHub = true;
-             state.peer.destroy();
+             state.isHub = true; state.peer.destroy();
              setTimeout(() => {
                const p2 = new Peer(state.roomId, CONFIG); 
                p2.on('open', () => {
-                 state.peer = p2;
-                 state.myId = state.roomId;
+                 state.peer = p2; state.myId = state.roomId;
                  util.log('👑 成为房主');
                  if(window.ui) window.ui.updateSelf();
                });
                p2.on('error', e => {
-                 if(e.type === 'unavailable-id') {
-                   state.isHub = false;
-                   setTimeout(() => this.startPeer(), 1000);
-                 }
+                 if(e.type === 'unavailable-id') { state.isHub = false; setTimeout(() => this.startPeer(), 1000); }
                });
                p2.on('connection', c => this.setupConn(c));
              }, 500);
            }
         }
       });
-      
       p.on('connection', conn => this.setupConn(conn));
     } catch(e) { util.log(`Fatal: ${e}`); }
   },
@@ -208,11 +152,9 @@ const core = {
     if(id === state.myId) return;
     if(!state.peer || state.peer.destroyed || (state.conns[id] && state.conns[id].open)) return;
     if(state.conns[id] && Date.now() - (state.conns[id].created||0) < 5000) return;
-
     try {
       const conn = state.peer.connect(id, {reliable: true});
-      conn.created = Date.now();
-      state.conns[id] = conn; 
+      conn.created = Date.now(); state.conns[id] = conn; 
       this.setupConn(conn);
     } catch(e){}
   },
@@ -221,11 +163,9 @@ const core = {
     conn.on('open', () => {
       state.conns[conn.peer] = conn;
       conn.send({t: 'HELLO', n: state.myName, id: state.myId});
-      this.exchange(); 
-      this.retryPending();
+      this.exchange(); this.retryPending();
       if(window.ui) window.ui.renderList();
     });
-
     conn.on('data', d => this.handleData(d, conn));
     conn.on('close', () => { delete state.conns[conn.peer]; if(window.ui) window.ui.renderList(); });
     conn.on('error', () => { delete state.conns[conn.peer]; if(window.ui) window.ui.renderList(); });
@@ -247,61 +187,55 @@ const core = {
     }
     
     if(d.t === 'PEER_EX') {
-      d.list.forEach(id => {
-        if(id !== state.myId && !state.conns[id]) this.connectTo(id);
-      });
+      d.list.forEach(id => { if(id !== state.myId && !state.conns[id]) this.connectTo(id); });
     }
     
     if(d.t === 'MSG') {
       if(state.seenMsgs.has(d.id)) return;
       state.seenMsgs.add(d.id);
-      
       if(d.n) {
         state.contacts[d.senderId] = {id: d.senderId, n: d.n, t: Date.now()};
         localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
       }
       
-      await db.saveMsg(d);
-      
+      // 核心修复：先上屏，再存库！
       const isPublic = d.target === 'all';
       const isToMe = d.target === state.myId || (state.isHub && d.target === state.roomId); 
       
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
-        
         if (state.activeChat === chatKey) {
-          if(window.ui) window.ui.appendMsg(d); // 如果正在看，直接上屏
+          if(window.ui) window.ui.appendMsg(d); // 立即显示！
         } else {
           state.unread[chatKey] = (state.unread[chatKey]||0) + 1;
           localStorage.setItem('p1_unread', JSON.stringify(state.unread));
-          if(window.ui) window.ui.renderList(); // 如果没看，刷新列表显示红点
+          if(window.ui) window.ui.renderList(); 
         }
       }
+      
+      db.saveMsg(d); // 异步存库
       
       if(d.target === 'all') this.flood(d, conn.peer);
     }
   },
 
   flood(pkt, exclude) {
-    Object.values(state.conns).forEach(c => {
-      if(c.peer !== exclude && c.open) c.send(pkt);
-    });
+    Object.values(state.conns).forEach(c => { if(c.peer !== exclude && c.open) c.send(pkt); });
   },
 
   async sendMsg(txt) {
     const pkt = {
       t: 'MSG', id: util.uuid(), n: state.myName, senderId: state.myId,
-      target: state.activeChat, 
-      txt: txt, ts: Date.now(), ttl: CONST.TTL
+      target: state.activeChat, txt: txt, ts: Date.now(), ttl: CONST.TTL
     };
-    
     state.seenMsgs.add(pkt.id);
     state.latestTs = Math.max(state.latestTs, pkt.ts);
     
-    await db.saveMsg(pkt);
-    await db.addPending(pkt);
+    // 核心修复：先上屏，再存库！
     if(window.ui) window.ui.appendMsg(pkt);
     
+    db.saveMsg(pkt);
+    db.addPending(pkt);
     this.retryPending();
   },
   
@@ -310,19 +244,12 @@ const core = {
     if(list.length === 0) return;
     const ready = Object.keys(state.conns).some(k => state.conns[k].open);
     if(!ready) return;
-
     list.forEach(async pkt => {
-      if(pkt.target === 'all') {
-        this.flood(pkt, null);
-      } else {
+      if(pkt.target === 'all') this.flood(pkt, null);
+      else {
         let sent = false;
-        if (state.conns[pkt.target] && state.conns[pkt.target].open) {
-          state.conns[pkt.target].send(pkt);
-          sent = true;
-        } else if (state.conns[state.roomId] && state.conns[state.roomId].open) {
-          state.conns[state.roomId].send(pkt);
-          sent = true;
-        }
+        if (state.conns[pkt.target] && state.conns[pkt.target].open) { state.conns[pkt.target].send(pkt); sent = true; } 
+        else if (state.conns[state.roomId] && state.conns[state.roomId].open) { state.conns[state.roomId].send(pkt); sent = true; }
         if (!sent) { this.connectTo(pkt.target); return; }
       }
       await db.removePending(pkt.id); 
@@ -363,7 +290,6 @@ const core = {
   }
 };
 
-// --- 5. UI (增强版) ---
 const ui = {
   init() {
     const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
@@ -408,18 +334,15 @@ const ui = {
   },
 
   switchChat(name, id) {
-    state.activeChat = name; // ID
-    state.activeChatName = id; // Name
+    state.activeChat = name; state.activeChatName = id;
     state.unread[name] = 0;
     localStorage.setItem('p1_unread', JSON.stringify(state.unread));
-    state.oldestTs = Date.now(); // 重置分页
-    
+    state.oldestTs = Date.now();
     document.getElementById('chatTitle').innerText = id;
     document.getElementById('chatStatus').innerText = name === 'all' ? '全员' : '私聊';
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
-    
     window.ui.clearMsgs();
-    core.loadHistory(50); // 切换时立即加载历史
+    core.loadHistory(50);
     this.renderList();
   },
 
@@ -440,8 +363,7 @@ const ui = {
     Object.keys(state.contacts).forEach(k => map.set(state.contacts[k].id, state.contacts[k]));
     Object.keys(state.conns).forEach(k => { 
       let name = state.conns[k].label;
-      if(!name && state.contacts[k]) name = state.contacts[k].n; 
-      if(!map.has(k)) map.set(k, {id:k, n: name || '未知'}); 
+      if(name) map.set(k, {id:k, n: name}); 
     });
     
     map.forEach((v, id) => {
@@ -452,7 +374,7 @@ const ui = {
 
       const unread = state.unread[id] || 0;
       let name = util.escape(v.n || '未知');
-      if(isSeed) name = '👑 ' + '房主';
+      if(isSeed) name = '👑 房主';
       
       html += `
         <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">
