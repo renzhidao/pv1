@@ -124,6 +124,7 @@ const core = {
       // 修复：即使我是基站，也要去连其他基站，防止孤岛
       this.connectToSeeds();
     } catch (e) {
+      util.log(`基站被占或不可用(${e.type})，启动普通节点...`);
       await this.startPeer('u_' + util.uuid());
       this.connect(seedId); // 连抢占位的那个
       this.connectToSeeds(); // 多连几个
@@ -158,7 +159,11 @@ const core = {
     return new Promise((resolve, reject) => {
       const p = new Peer(id, CONFIG);
       p.on('open', pid => { state.myId = pid; state.peer = p; if(window.ui) window.ui.updateSelf(); resolve(); });
-      p.on('error', e => { if(e.type==='unavailable-id') reject(e); });
+      // 修复：捕获所有错误，防止 Promise 永远挂起导致“一直连接中”
+      p.on('error', e => { 
+        util.log(`PeerErr: ${e.type}`); 
+        reject(e); 
+      });
       p.on('connection', c => this.handleConn(c));
     });
   },
