@@ -35,7 +35,7 @@ const app = {
 
   init() {
     localStorage.setItem('p1_my_id', this.myId);
-    this.log(`🚀 启动 | ID: ${this.myId}`);
+    this.log(` 启动 | ID: ${this.myId}`);
     
     // 修复1: 刷新前自杀，释放ID
     window.addEventListener('beforeunload', () => {
