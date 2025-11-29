@@ -1,17 +1,23 @@
 (function(){
 'use strict';
 
-// --- 1. 配置 (回归 v2 经典配置) ---
+// --- 1. 配置 ---
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 1
 };
 
-// 房间号生成 (每1小时轮换，比v2的10分钟更稳)
-const getRoomId = () => 'p1-room-' + Math.floor(Date.now() / 3600000);
+const CONST = {
+  SEED_COUNT: 20,
+  MAX_PEERS: 8,
+  MIN_PEERS: 4,
+  PEX_INTERVAL: 10000,
+  TTL: 16,
+  SYNC_LIMIT: 100
+};
 
-// --- 2. 数据库 (保留新版功能) ---
+// --- 2. 数据库 ---
 const db = {
   _db: null,
   async init() {
@@ -64,10 +70,12 @@ const db = {
 // --- 3. 全局状态 ---
 const state = {
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
-  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
+  myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
   peer: null,
-  conns: {}, // v2 风格连接池
+  conns: {}, // 连接池
   contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
+  isHub: false,
+  roomId: '', // 动态计算
   
   // 新版状态
   activeChat: 'all', 
@@ -91,7 +99,7 @@ const util = {
   }
 };
 
-// --- 4. 核心逻辑 (v2 连接架构 + v3 数据处理) ---
+// --- 4. 核心逻辑 (v3 内核 + v5 数据 + PEX 辅助) ---
 const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
@@ -102,16 +110,19 @@ const core = {
     
     this.startPeer();
     
-    // v2 核心循环：定期清理、重连房间、重连联系人
+    // 死命重连循环 (v3 特性)
     setInterval(() => {
       this.cleanup();
-      const roomId = getRoomId();
+      const roomId = 'p1-room-' + Math.floor(Date.now() / 3600000); // 1小时轮换
+      state.roomId = roomId;
       
-      // 房间连接逻辑 (v2)
-      const hubConn = state.conns[roomId];
-      if (!hubConn || !hubConn.open) this.connectTo(roomId);
+      // 1. 没连上房主，就去连房主
+      if (!state.isHub) {
+        const hubConn = state.conns[roomId];
+        if (!hubConn || !hubConn.open) this.connectTo(roomId);
+      }
       
-      // 联系人重连 (v2)
+      // 2. 断线重连通讯录里的老友
       Object.values(state.contacts).forEach(c => {
         if(c.id && c.id !== state.myId && (!state.conns[c.id] || !state.conns[c.id].open)) {
            this.connectTo(c.id);
@@ -119,7 +130,8 @@ const core = {
       });
       
       this.sendPing();
-      this.retryPending(); // 新版：离线重发
+      this.retryPending(); // 离线重发
+      this.exchange(); // PEX 交换
     }, 5000);
     
     if(window.ui) window.ui.init();
@@ -127,7 +139,7 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v2.5 融合版)`);
+    util.log(`🚀 启动 (v8 终极版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
@@ -136,14 +148,28 @@ const core = {
         state.peer = p;
         util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
-        this.connectTo(getRoomId()); // 立即进房
+        this.connectTo(state.roomId); // 立即进房
       });
       
       p.on('error', err => {
         util.log(`PeerErr: ${err.type}`);
-        // v2 经典容错：如果房间满员/不可用，尝试接管（简单版）
+        // v3 核心：抢房主逻辑
         if (err.type === 'peer-unavailable' && err.message.includes('room')) {
-           // 这里不做复杂抢主，直接等待或重试，保持 v2 的简单性
+           if(!state.isHub) {
+             util.log('🚨 房间空闲，正在上位...');
+             state.isHub = true;
+             state.peer.destroy();
+             setTimeout(() => {
+               const p2 = new Peer(state.roomId, CONFIG); // 用房间号作为 ID
+               p2.on('open', () => {
+                 state.peer = p2;
+                 state.myId = state.roomId;
+                 util.log('👑 我已成为房主');
+                 if(window.ui) window.ui.updateSelf();
+               });
+               p2.on('connection', c => this.setupConn(c));
+             }, 500);
+           }
         }
       });
       
@@ -164,8 +190,8 @@ const core = {
       state.conns[conn.peer] = conn;
       if(window.ui) window.ui.renderList();
       conn.send({t: 'HELLO', n: state.myName, id: state.myId});
-      this.exchange(); // v2 交换逻辑
-      this.retryPending(); // 连上人就尝试发离线消息
+      this.exchange(); 
+      this.retryPending();
     });
 
     conn.on('data', d => this.handleData(d, conn));
@@ -175,7 +201,7 @@ const core = {
 
   async handleData(d, conn) {
     if(d.t === 'PING') return conn.send({t: 'PONG'});
-    if(d.t === 'PONG') return; // 简化处理
+    if(d.t === 'PONG') return; 
 
     if(d.t === 'HELLO') {
       conn.label = d.n;
@@ -184,6 +210,7 @@ const core = {
       if(window.ui) window.ui.renderList();
     }
     
+    // PEX 核心：邻居告诉我还有谁在线，我去连他们
     if(d.t === 'PEER_EX') {
       d.list.forEach(id => {
         if(id !== state.myId && !state.conns[id]) this.connectTo(id);
@@ -195,11 +222,10 @@ const core = {
       state.seenMsgs.add(d.id);
       state.latestTs = Math.max(state.latestTs, d.ts);
       
-      // v3 增强：存库 + UI逻辑
       await db.saveMsg(d);
       
       const isPublic = d.target === 'all';
-      const isToMe = d.target === state.myId;
+      const isToMe = d.target === state.myId || (state.isHub && d.target === state.roomId); // 房主兼容
       
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
@@ -211,7 +237,6 @@ const core = {
         }
       }
       
-      // v2 转发逻辑：如果是群聊，扩散给除来源外的所有人
       if(d.target === 'all') this.flood(d, conn.peer);
     }
   },
@@ -225,14 +250,13 @@ const core = {
   async sendMsg(txt) {
     const pkt = {
       t: 'MSG', id: util.uuid(), n: state.myName, senderId: state.myId,
-      target: state.activeChat, // 'all' or PeerID
+      target: state.activeChat, 
       txt: txt, ts: Date.now()
     };
     
     state.seenMsgs.add(pkt.id);
     state.latestTs = Math.max(state.latestTs, pkt.ts);
     
-    // 先存库，再进队列，再展示
     await db.saveMsg(pkt);
     await db.addPending(pkt);
     if(window.ui) window.ui.appendMsg(pkt);
@@ -243,36 +267,23 @@ const core = {
   async retryPending() {
     const list = await db.getPending();
     if(list.length === 0) return;
-    
-    // 只要连上任何一个人（且不是房间ID本身），就开始尝试发送
-    const ready = Object.keys(state.conns).some(id => !id.includes('p1-room'));
+    const ready = Object.keys(state.conns).length > 0;
     if(!ready) return;
 
     list.forEach(async pkt => {
       if(pkt.target === 'all') {
         this.flood(pkt, null);
       } else {
-        // 私聊：尝试直连发送
         const conn = state.conns[pkt.target];
         if(conn && conn.open) conn.send(pkt);
-        else {
-          // 如果没连上目标，先尝试连一下，暂不删队列
-          this.connectTo(pkt.target); 
-          return; 
-        }
+        else { this.connectTo(pkt.target); return; }
       }
-      // 发送成功（或已广播），移出队列
       await db.removePending(pkt.id); 
     });
   },
 
-  sendPing() {
-    Object.values(state.conns).forEach(c => { if(c.open) c.send({t: 'PING'}); });
-  },
-
-  cleanup() {
-    Object.keys(state.conns).forEach(pid => { if(!state.conns[pid].open) delete state.conns[pid]; });
-  },
+  sendPing() { Object.values(state.conns).forEach(c => { if(c.open) c.send({t: 'PING'}); }); },
+  cleanup() { Object.keys(state.conns).forEach(pid => { if(!state.conns[pid].open) delete state.conns[pid]; }); },
   
   exchange() {
     const list = Object.values(state.contacts).map(c => c.id).filter(id => id);
@@ -297,7 +308,7 @@ const core = {
   }
 };
 
-// --- 5. UI (保持最新版汉化界面) ---
+// --- 5. UI (保持最新) ---
 const ui = {
   init() {
     const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
@@ -327,7 +338,6 @@ const ui = {
       r.readAsDataURL(f); this.value = '';
     };
     bind('btnBack', () => document.getElementById('sidebar').classList.remove('hidden'));
-    
     const box = document.getElementById('msgList');
     box.addEventListener('scroll', () => { if(box.scrollTop === 0) core.loadHistory(20); });
 
@@ -338,29 +348,26 @@ const ui = {
   updateSelf() {
     document.getElementById('myId').innerText = state.myId.slice(0,6);
     document.getElementById('myNick').innerText = state.myName;
-    document.getElementById('statusText').innerText = '在线';
+    document.getElementById('statusText').innerText = state.isSeed ? '👑 房主' : '在线';
     document.getElementById('statusDot').className = 'dot online';
   },
 
-  switchChat(target, name) {
-    state.activeChat = target;
-    state.activeChatName = name;
-    state.unread[target] = 0;
-    state.oldestTs = Date.now(); // 重置分页游标
-    
-    document.getElementById('chatTitle').innerText = name;
-    document.getElementById('chatStatus').innerText = target === 'all' ? '全员' : '私聊';
+  switchChat(name, id) {
+    state.activeChat = name;
+    state.activeChatName = id;
+    state.unread[name] = 0;
+    state.oldestTs = Date.now();
+    document.getElementById('chatTitle').innerText = id;
+    document.getElementById('chatStatus').innerText = name === 'all' ? '全员' : '私聊';
     if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
-    
     window.ui.clearMsgs();
-    core.loadHistory(50); // 重新加载该会话历史
+    core.loadHistory(50);
     this.renderList();
   },
 
   renderList() {
     const list = document.getElementById('contactList');
     document.getElementById('onlineCount').innerText = Object.keys(state.conns).length;
-    
     const pubUnread = state.unread['all'] || 0;
     let html = `
       <div class="contact-item ${state.activeChat==='all'?'active':''}" onclick="ui.switchChat('all', '公共频道')">
@@ -369,7 +376,6 @@ const ui = {
       </div>
     `;
     
-    // 合并 contacts 和 activeConns
     const map = new Map();
     Object.keys(state.contacts).forEach(k => map.set(state.contacts[k].id, state.contacts[k]));
     Object.keys(state.conns).forEach(k => { if(!map.has(k)) map.set(k, {id:k, n:state.conns[k].label}); });
@@ -414,7 +420,6 @@ const ui = {
         </div>
       </div>`;
 
-    // 排序插入
     const children = Array.from(box.children);
     let inserted = false;
     for (let i = children.length - 1; i >= 0; i--) {

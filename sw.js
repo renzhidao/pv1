@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-v117-hybrid';
+const CACHE_NAME = 'p1-v119-final';
 const ASSETS = [
   './', 
   './index.html', 
