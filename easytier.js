@@ -9,10 +9,9 @@ const CONFIG = {
 };
 
 const CONST = {
-  SEED_COUNT: 5, 
-  MAX_PEERS: 12, 
+  MAX_PEERS: 8,
   MIN_PEERS: 4,
-  PEX_INTERVAL: 8000,
+  PEX_INTERVAL: 10000,
   TTL: 16,
   SYNC_LIMIT: 100
 };
@@ -75,6 +74,8 @@ const state = {
   conns: {}, 
   contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   isHub: false,
+  roomId: '', 
+  
   activeChat: 'all', activeChatName: '公共频道', unread: {},
   seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
 };
@@ -91,7 +92,7 @@ const util = {
   }
 };
 
-// --- 4. 核心逻辑 ---
+// --- 4. 核心逻辑 (回归 v3 单中心抢占) ---
 const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
@@ -103,7 +104,23 @@ const core = {
     
     setInterval(() => {
       this.cleanup();
-      this.connectToSeeds();
+      // 始终指向当前小时的唯一房间ID
+      const roomId = 'p1-room-' + Math.floor(Date.now() / 3600000);
+      state.roomId = roomId;
+      
+      // 核心复原：如果你不是房主，就必须连房主
+      if (!state.isHub) {
+        const hubConn = state.conns[roomId];
+        if (!hubConn || !hubConn.open) this.connectTo(roomId);
+      }
+      
+      Object.values(state.contacts).forEach(c => {
+        if(c.id && c.id !== state.myId && (!state.conns[c.id] || !state.conns[c.id].open)) {
+           // 只有最近活跃的人才重连，避免僵尸
+           if (Date.now() - c.t < 86400000) this.connectTo(c.id);
+        }
+      });
+      
       this.sendPing();
       this.retryPending(); 
       this.exchange(); 
@@ -114,7 +131,7 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v9.1 UI修复版)`);
+    util.log(`🚀 启动 (v9.2 单中心回归版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
@@ -123,49 +140,45 @@ const core = {
         state.peer = p;
         util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
-        this.connectToSeeds();
+        // 上线立马连房主
+        setTimeout(() => this.connectTo(state.roomId), 500);
       });
       
       p.on('error', err => {
         util.log(`PeerErr: ${err.type}`);
-        if (err.type === 'peer-unavailable' && err.message.includes('p1-seed-')) {
-           if(Object.keys(state.conns).length === 0 && !state.isHub) {
-             const targetSeed = err.message.split(' ').pop(); 
-             this.tryBecomeHub(targetSeed);
+        
+        // 核心复原：抢房主逻辑
+        // 如果连不上房主（说明房主不在），我自己上位！
+        if (err.type === 'peer-unavailable' && err.message.includes('room')) {
+           if(!state.isHub) {
+             util.log('🚨 房间空闲，正在上位...');
+             state.isHub = true;
+             state.peer.destroy();
+             setTimeout(() => {
+               // 用房间 ID 重生
+               const p2 = new Peer(state.roomId, CONFIG); 
+               p2.on('open', () => {
+                 state.peer = p2;
+                 state.myId = state.roomId;
+                 util.log('👑 我已成为房主');
+                 if(window.ui) window.ui.updateSelf();
+               });
+               p2.on('error', e => {
+                 // 抢位失败（可能正好有人也在抢），回退做普通人
+                 if(e.type === 'unavailable-id') {
+                   state.isHub = false;
+                   util.log('👑 上位失败，回退');
+                   setTimeout(() => this.startPeer(), 1000);
+                 }
+               });
+               p2.on('connection', c => this.setupConn(c));
+             }, 500);
            }
         }
       });
       
       p.on('connection', conn => this.setupConn(conn));
     } catch(e) { util.log(`Fatal: ${e}`); }
-  },
-  
-  tryBecomeHub(seedId) {
-    if(state.isHub) return;
-    util.log(`🚨 发现空位 ${seedId}，尝试上位...`);
-    state.isHub = true;
-    state.peer.destroy();
-    setTimeout(() => {
-      const p2 = new Peer(seedId, CONFIG); 
-      p2.on('open', () => {
-        state.peer = p2;
-        state.myId = seedId;
-        util.log(`👑 我已成为房主: ${seedId}`);
-        if(window.ui) window.ui.updateSelf();
-      });
-      p2.on('error', () => {
-        state.isHub = false;
-        setTimeout(() => this.startPeer(), 1000);
-      });
-      p2.on('connection', c => this.setupConn(c));
-    }, 500);
-  },
-
-  connectToSeeds() {
-    for(let i=0; i<CONST.SEED_COUNT; i++) {
-      const s = `p1-seed-${i}`;
-      if(s !== state.myId) this.connectTo(s);
-    }
   },
 
   connectTo(id) {
@@ -184,10 +197,10 @@ const core = {
   setupConn(conn) {
     conn.on('open', () => {
       state.conns[conn.peer] = conn;
-      conn.send({t: 'HELLO', n: state.myName, id: state.myId, pop: Object.keys(state.conns).length});
+      conn.send({t: 'HELLO', n: state.myName, id: state.myId});
       this.exchange(); 
       this.retryPending();
-      if(window.ui) window.ui.renderList(); // 连上时刷新列表
+      if(window.ui) window.ui.renderList();
     });
 
     conn.on('data', d => this.handleData(d, conn));
@@ -203,22 +216,11 @@ const core = {
       conn.label = d.n;
       state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
       
-      if (state.isHub && d.id.includes('p1-seed-')) {
-        const myPop = Object.keys(state.conns).length;
-        const theirPop = d.pop || 0;
-        if (theirPop > myPop + 2 || (Math.abs(theirPop - myPop) <= 2 && d.id < state.myId)) {
-          util.log(`🏳️ 发现更强房主 ${d.id}，正在合并...`);
-          state.isHub = false;
-          state.peer.destroy();
-          setTimeout(() => this.startPeer(), 1000); 
-          return;
-        }
+      if(d.id === state.roomId) {
+        state.contacts['房主'] = {id: state.roomId, t: Date.now(), n: '房主'};
+        conn.label = '房主';
       }
-
-      if(d.id.includes('p1-seed-')) {
-        state.contacts[d.id] = {id: d.id, t: Date.now(), n: '👑 ' + d.id};
-        conn.label = '👑 ' + d.id;
-      }
+      
       localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
       if(window.ui) window.ui.renderList();
     }
@@ -237,7 +239,7 @@ const core = {
       await db.saveMsg(d);
       
       const isPublic = d.target === 'all';
-      const isToMe = d.target === state.myId || (state.isHub && state.myId.includes('p1-seed-'));
+      const isToMe = d.target === state.myId || (state.isHub && d.target === state.roomId); 
       
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
@@ -280,7 +282,7 @@ const core = {
   async retryPending() {
     const list = await db.getPending();
     if(list.length === 0) return;
-    const ready = Object.keys(state.conns).some(k => state.conns[k].open); // 必须 open 才能发
+    const ready = Object.keys(state.conns).some(k => state.conns[k].open); 
     if(!ready) return;
 
     list.forEach(async pkt => {
@@ -303,7 +305,7 @@ const core = {
       const c = state.conns[pid];
       if(!c.open && (now - (c.created || 0) > 10000)) {
         delete state.conns[pid]; 
-        if(window.ui) window.ui.renderList(); // 状态变化刷新UI
+        if(window.ui) window.ui.renderList(); 
       }
     }); 
   },
@@ -390,7 +392,7 @@ const ui = {
 
   renderList() {
     const list = document.getElementById('contactList');
-    // 修复：只统计真正 open 的连接
+    // 只统计真实连接
     const onlineCount = Object.values(state.conns).filter(c => c.open).length;
     document.getElementById('onlineCount').innerText = onlineCount;
     
@@ -413,15 +415,14 @@ const ui = {
     map.forEach((v, id) => {
       if(id === state.myId) return; 
       
-      // 修复：隐藏未连接的种子节点，只显示已连接的或普通用户
-      const isSeed = id.includes('p1-seed-');
+      // 核心逻辑：只有真正连上的房主，或者普通用户，才显示在线
       const isOnline = state.conns[id] && state.conns[id].open;
-      
-      if (isSeed && !isOnline) return; // 隐藏离线种子
+      const isSeed = id.includes('p1-room'); // 注意：现在房主ID是这个格式
+      if (isSeed && !isOnline) return; // 隐藏离线房主
 
       const unread = state.unread[id] || 0;
       let name = util.escape(v.n || '未知');
-      if(isSeed) name = '👑 ' + id;
+      if(isSeed) name = '👑 ' + '房主';
       
       html += `
         <div class="contact-item ${state.activeChat===id?'active':''}" onclick="ui.switchChat('${id}', '${name}')">

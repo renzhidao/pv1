@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-v119-final';
+const CACHE_NAME = 'p1-v120-stable-rollback';
 const ASSETS = [
   './', 
   './index.html', 
