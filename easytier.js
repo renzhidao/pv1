@@ -12,7 +12,7 @@ const CONST = {
   MAX_PEERS: 8, MIN_PEERS: 4, PEX_INTERVAL: 10000, TTL: 16, SYNC_LIMIT: 100
 };
 
-// --- 2. 数据库 (辅助角色) ---
+// --- 2. 数据库 ---
 const db = {
   _db: null,
   async init() {
@@ -24,7 +24,7 @@ const db = {
         if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending', { keyPath: 'id' });
       };
       req.onsuccess = e => { this._db = e.target.result; r(); };
-      req.onerror = () => r(); // 失败也不卡死
+      req.onerror = () => r(); 
     });
   },
   async saveMsg(msg) {
@@ -71,10 +71,34 @@ const state = {
   seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
 };
 
+// --- 日志与工具 ---
+const logSystem = {
+  logs: [], lastLog: null, count: 1,
+  add(text) {
+    const msg = `[${new Date().toLocaleTimeString()}] ${text}`;
+    if (this.lastLog === text) {
+      this.count++;
+      const el = document.getElementById('logContent');
+      if(el && el.lastChild) el.lastChild.innerText = `${msg} (x${this.count})`;
+    } else {
+      this.count = 1; this.lastLog = text; this.logs.push(msg);
+      if(this.logs.length > 500) this.logs.shift();
+      const el = document.getElementById('logContent');
+      if(el) {
+        const div = document.createElement('div');
+        div.innerText = msg; div.style.borderBottom = '1px solid #333';
+        el.appendChild(div); el.scrollTop = el.scrollHeight;
+      }
+    }
+    console.log(msg);
+  }
+};
+
 const util = {
-  log: (s) => { console.log(`[P1] ${s}`); }, // 简化日志
+  log: (s) => logSystem.add(s),
   uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  escape: (s) => (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[c]))
+  // 十六进制转义修复 XML 解析错误
+  escape: (s) => (s||'').toString().replace(/\x26/g, '\x26amp;').replace(/\x3c/g, '\x26lt;').replace(/\x3e/g, '\x26gt;').replace(/\x22/g, '\x26quot;').replace(/\x27/g, '\x26#039;')
 };
 
 // --- 4. 核心逻辑 ---
@@ -86,9 +110,7 @@ const core = {
     await db.init();
     if(window.ui) window.ui.init();
     
-    // 历史记录异步加载，不阻塞启动
     this.loadHistory(20);
-    
     this.startPeer();
     
     setInterval(() => {
@@ -198,14 +220,13 @@ const core = {
         localStorage.setItem('p1_contacts', JSON.stringify(state.contacts));
       }
       
-      // 核心修复：先上屏，再存库！
       const isPublic = d.target === 'all';
       const isToMe = d.target === state.myId || (state.isHub && d.target === state.roomId); 
       
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
         if (state.activeChat === chatKey) {
-          if(window.ui) window.ui.appendMsg(d); // 立即显示！
+          if(window.ui) window.ui.appendMsg(d); 
         } else {
           state.unread[chatKey] = (state.unread[chatKey]||0) + 1;
           localStorage.setItem('p1_unread', JSON.stringify(state.unread));
@@ -213,7 +234,7 @@ const core = {
         }
       }
       
-      db.saveMsg(d); // 异步存库
+      db.saveMsg(d); 
       
       if(d.target === 'all') this.flood(d, conn.peer);
     }
@@ -231,7 +252,6 @@ const core = {
     state.seenMsgs.add(pkt.id);
     state.latestTs = Math.max(state.latestTs, pkt.ts);
     
-    // 核心修复：先上屏，再存库！
     if(window.ui) window.ui.appendMsg(pkt);
     
     db.saveMsg(pkt);
@@ -304,7 +324,7 @@ const ui = {
     });
     bind('btnToggleLog', () => { const el = document.getElementById('miniLog'); el.style.display = el.style.display === 'flex'?'none':'flex'; });
     bind('btnSettings', () => { document.getElementById('settings-panel').style.display = 'grid'; document.getElementById('iptNick').value = state.myName; });
-    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
+    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none';);
     bind('btnSave', () => {
        const n = document.getElementById('iptNick').value.trim();
        if(n) { state.myName = n; localStorage.setItem('nickname', n); ui.updateSelf(); }
