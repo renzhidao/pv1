@@ -1,7 +1,6 @@
 (function(){
 'use strict';
 
-// --- 1. 配置 ---
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
@@ -12,7 +11,6 @@ const CONST = {
   MAX_PEERS: 8, MIN_PEERS: 4, PEX_INTERVAL: 10000, TTL: 16, SYNC_LIMIT: 100
 };
 
-// --- 2. 数据库 ---
 const db = {
   _db: null,
   async init() {
@@ -24,7 +22,7 @@ const db = {
         if(!d.objectStoreNames.contains('pending')) d.createObjectStore('pending', { keyPath: 'id' });
       };
       req.onsuccess = e => { this._db = e.target.result; r(); };
-      req.onerror = () => r(); 
+      req.onerror = () => r();
     });
   },
   async saveMsg(msg) {
@@ -61,7 +59,6 @@ const db = {
   async removePending(id) { if(this._db) this._db.transaction(['pending'], 'readwrite').objectStore('pending').delete(id); }
 };
 
-// --- 3. 全局状态 ---
 const state = {
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
@@ -71,37 +68,15 @@ const state = {
   seenMsgs: new Set(), latestTs: 0, oldestTs: Date.now(), loading: false
 };
 
-// --- 日志与工具 ---
-const logSystem = {
-  logs: [], lastLog: null, count: 1,
-  add(text) {
-    const msg = `[${new Date().toLocaleTimeString()}] ${text}`;
-    if (this.lastLog === text) {
-      this.count++;
-      const el = document.getElementById('logContent');
-      if(el && el.lastChild) el.lastChild.innerText = `${msg} (x${this.count})`;
-    } else {
-      this.count = 1; this.lastLog = text; this.logs.push(msg);
-      if(this.logs.length > 500) this.logs.shift();
-      const el = document.getElementById('logContent');
-      if(el) {
-        const div = document.createElement('div');
-        div.innerText = msg; div.style.borderBottom = '1px solid #333';
-        el.appendChild(div); el.scrollTop = el.scrollHeight;
-      }
-    }
-    console.log(msg);
+const util = {
+  log: (s) => console.log(`[P1] ${s}`),
+  uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
+  escape: (s) => {
+    if(!s) return '';
+    return s.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, '&#039;');
   }
 };
 
-const util = {
-  log: (s) => logSystem.add(s),
-  uuid: () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36),
-  // 十六进制转义修复 XML 解析错误
-  escape: (s) => (s||'').toString().replace(/\x26/g, '\x26amp;').replace(/\x3c/g, '\x26lt;').replace(/\x3e/g, '\x26gt;').replace(/\x22/g, '\x26quot;').replace(/\x27/g, '\x26#039;')
-};
-
-// --- 4. 核心逻辑 ---
 const core = {
   async init() {
     if(typeof Peer === 'undefined') return console.error('PeerJS missing');
@@ -138,12 +113,11 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    
     try {
       const p = new Peer(state.myId, CONFIG);
       p.on('open', id => {
         state.myId = id; state.peer = p;
-        util.log(`✅ 上线: ${id}`);
+        util.log(`上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
         setTimeout(() => this.connectTo(state.roomId), 500);
       });
@@ -155,7 +129,7 @@ const core = {
                const p2 = new Peer(state.roomId, CONFIG); 
                p2.on('open', () => {
                  state.peer = p2; state.myId = state.roomId;
-                 util.log('👑 成为房主');
+                 util.log('成为房主');
                  if(window.ui) window.ui.updateSelf();
                });
                p2.on('error', e => {
@@ -226,7 +200,7 @@ const core = {
       if (isPublic || isToMe) {
         const chatKey = isPublic ? 'all' : d.senderId;
         if (state.activeChat === chatKey) {
-          if(window.ui) window.ui.appendMsg(d); 
+          if(window.ui) window.ui.appendMsg(d);
         } else {
           state.unread[chatKey] = (state.unread[chatKey]||0) + 1;
           localStorage.setItem('p1_unread', JSON.stringify(state.unread));
@@ -234,7 +208,7 @@ const core = {
         }
       }
       
-      db.saveMsg(d); 
+      db.saveMsg(d);
       
       if(d.target === 'all') this.flood(d, conn.peer);
     }
@@ -324,7 +298,7 @@ const ui = {
     });
     bind('btnToggleLog', () => { const el = document.getElementById('miniLog'); el.style.display = el.style.display === 'flex'?'none':'flex'; });
     bind('btnSettings', () => { document.getElementById('settings-panel').style.display = 'grid'; document.getElementById('iptNick').value = state.myName; });
-    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none';);
+    bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
     bind('btnSave', () => {
        const n = document.getElementById('iptNick').value.trim();
        if(n) { state.myName = n; localStorage.setItem('nickname', n); ui.updateSelf(); }
