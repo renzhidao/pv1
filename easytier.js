@@ -72,7 +72,7 @@ const state = {
   myId: localStorage.getItem('p1_my_id') || ('u_' + Math.random().toString(36).substr(2, 9)),
   myName: localStorage.getItem('nickname') || '用户'+Math.floor(Math.random()*1000),
   peer: null,
-  conns: {}, 
+  conns: {}, // 连接池
   contacts: JSON.parse(localStorage.getItem('p1_contacts') || '{}'),
   isHub: false,
   roomId: '', 
@@ -111,17 +111,24 @@ const core = {
     
     setInterval(() => {
       this.cleanup();
+      // 修复：房间ID固定为小时级，减少变动
       const roomId = 'p1-room-' + Math.floor(Date.now() / 3600000);
       state.roomId = roomId;
       
+      // 修复：只有当我也不是房主，且也没连上房主时，才尝试连
       if (!state.isHub) {
         const hubConn = state.conns[roomId];
         if (!hubConn || !hubConn.open) this.connectTo(roomId);
       }
       
+      // 修复：重连逻辑增加间隔检查，防止频繁重试
       Object.values(state.contacts).forEach(c => {
+        // 如果最后一次尝试连接是在10秒内，不要重试，给点时间
+        if(c.lastTry && Date.now() - c.lastTry < 10000) return;
+        
         if(c.id && c.id !== state.myId && (!state.conns[c.id] || !state.conns[c.id].open)) {
            this.connectTo(c.id);
+           c.lastTry = Date.now();
         }
       });
       
@@ -135,7 +142,7 @@ const core = {
 
   startPeer() {
     if(state.peer && !state.peer.destroyed) return;
-    util.log(`🚀 启动 (v8.2 修复版)`);
+    util.log(`🚀 启动 (v8.3 稳定版)`);
     
     try {
       const p = new Peer(state.myId, CONFIG);
@@ -144,26 +151,45 @@ const core = {
         state.peer = p;
         util.log(`✅ 上线: ${id}`);
         if(window.ui) window.ui.updateSelf();
-        this.connectTo(state.roomId); 
+        
+        // 启动后延迟一点再连，防止信令未就绪
+        setTimeout(() => this.connectTo(state.roomId), 500);
       });
       
       p.on('error', err => {
         util.log(`PeerErr: ${err.type}`);
+        // 抢房主逻辑：必须非常谨慎
         if (err.type === 'peer-unavailable' && err.message.includes('room')) {
+           // 只有当我还没变成房主时，才尝试变身
            if(!state.isHub) {
-             util.log('🚨 房间空闲，正在上位...');
-             state.isHub = true;
-             state.peer.destroy();
+             // 增加随机延迟，防止两人同时抢
+             const delay = Math.random() * 2000;
              setTimeout(() => {
-               const p2 = new Peer(state.roomId, CONFIG); 
-               p2.on('open', () => {
-                 state.peer = p2;
-                 state.myId = state.roomId;
-                 util.log('👑 我已成为房主');
-                 if(window.ui) window.ui.updateSelf();
-               });
-               p2.on('connection', c => this.setupConn(c));
-             }, 500);
+               // 二次检查：延迟后是否已经连上了？如果连上了就别抢了
+               if(state.conns[state.roomId] && state.conns[state.roomId].open) return;
+               
+               util.log('🚨 房间空闲，尝试接管...');
+               state.isHub = true;
+               state.peer.destroy();
+               setTimeout(() => {
+                 const p2 = new Peer(state.roomId, CONFIG); 
+                 p2.on('open', () => {
+                   state.peer = p2;
+                   state.myId = state.roomId;
+                   util.log('👑 我已成为房主');
+                   if(window.ui) window.ui.updateSelf();
+                 });
+                 // 如果接管失败（比如被别人抢了），回退
+                 p2.on('error', e => {
+                   if(e.type === 'unavailable-id') {
+                     state.isHub = false;
+                     util.log('👑 接管失败，回退');
+                     setTimeout(() => this.startPeer(), 1000);
+                   }
+                 });
+                 p2.on('connection', c => this.setupConn(c));
+               }, 500);
+             }, delay);
            }
         }
       });
@@ -173,9 +199,18 @@ const core = {
   },
 
   connectTo(id) {
-    if(!state.peer || state.peer.destroyed || id === state.myId || (state.conns[id] && state.conns[id].open)) return;
+    // 核心修复：严防死循环连接自己
+    if(id === state.myId) return;
+    if(!state.peer || state.peer.destroyed || (state.conns[id] && state.conns[id].open)) return;
+    
+    // 限制连接频率
+    if(state.conns[id] && Date.now() - state.conns[id].created < 5000) return;
+
     try {
       const conn = state.peer.connect(id, {reliable: true});
+      // 标记创建时间，防止被 cleanup 误删
+      conn.created = Date.now();
+      state.conns[id] = conn; // 先占位
       this.setupConn(conn);
     } catch(e){}
   },
@@ -201,7 +236,6 @@ const core = {
       conn.label = d.n;
       state.contacts[d.n] = {id: d.id || conn.peer, t: Date.now()};
       
-      // 修复：如果是房主，强制改名为“房主”
       if(d.id === state.roomId) {
         state.contacts['房主'] = {id: state.roomId, t: Date.now(), n: '房主'};
         conn.label = '房主';
@@ -267,7 +301,8 @@ const core = {
   async retryPending() {
     const list = await db.getPending();
     if(list.length === 0) return;
-    const ready = Object.keys(state.conns).length > 0;
+    // 只要有连接就发
+    const ready = Object.keys(state.conns).some(k => state.conns[k].open);
     if(!ready) return;
 
     list.forEach(async pkt => {
@@ -283,7 +318,17 @@ const core = {
   },
 
   sendPing() { Object.values(state.conns).forEach(c => { if(c.open) c.send({t: 'PING'}); }); },
-  cleanup() { Object.keys(state.conns).forEach(pid => { if(!state.conns[pid].open) delete state.conns[pid]; }); },
+  
+  cleanup() { 
+    const now = Date.now();
+    Object.keys(state.conns).forEach(pid => { 
+      const c = state.conns[pid];
+      // 核心修复：如果是刚创建不到 10 秒的连接，别删！正在握手呢！
+      if(!c.open && (now - (c.created || 0) > 10000)) {
+        delete state.conns[pid]; 
+      }
+    }); 
+  },
   
   exchange() {
     const list = Object.values(state.contacts).map(c => c.id).filter(id => id);
@@ -386,13 +431,11 @@ const ui = {
     
     map.forEach((v, id) => {
       if(id === state.myId) return; // 不显示自己
-      // 修复核心：不再过滤 p1-room-xxx，让房主显示出来
       
       const unread = state.unread[id] || 0;
       const isOnline = !!state.conns[id];
       let name = util.escape(v.n || '未知');
       
-      // UI 美化：给房主加皇冠
       if(id.includes('p1-room')) name = '👑 房主';
       
       html += `
